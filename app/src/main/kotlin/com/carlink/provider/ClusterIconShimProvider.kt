@@ -18,7 +18,7 @@ import java.util.LinkedHashMap
 
 /**
  * Shim ContentProvider that claims the orphaned authority
- * `com.google.android.apps.automotive.templates.host.ClusterIconContentProvider`.
+ * `cc.funkemunky.carlink.ClusterIconContentProvider`.
  *
  * GM's Templates Host has this provider class but never registers it in its manifest.
  * When Templates Host converts CarIcon maneuver icons into navstate2 protobuf, it calls
