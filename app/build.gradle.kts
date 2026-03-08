@@ -12,11 +12,11 @@ android {
 //###############################################
 
     defaultConfig {
-        applicationId = "zeno.carlink"
+        applicationId = "cc.funkemunky.carlink"
         minSdk = 32
         targetSdk = 36
         versionCode = 86
-        versionName = "1.0.0"
+        versionName = "1.0.2"
 
 //###############################################
 //###############################################

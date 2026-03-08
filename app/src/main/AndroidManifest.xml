@@ -144,10 +144,10 @@
             android:value="true" />
 
         <!-- Shim for Templates Host's unregistered ClusterIconContentProvider.
-             Claims the orphaned authority so icon delivery works for cluster display. -->
+             Claims the authority using the applicationId to avoid conflicts on upload. -->
         <provider
             android:name=".provider.ClusterIconShimProvider"
-            android:authorities="com.google.android.apps.automotive.templates.host.ClusterIconContentProvider"
+            android:authorities="cc.funkemunky.carlink.ClusterIconContentProvider"
             android:exported="true"
             android:grantUriPermissions="true"
             tools:ignore="ExportedContentProvider" />
