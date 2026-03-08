@@ -298,6 +298,48 @@ When capturing USB packets from a wireless CarPlay session:
 
 **Note:** Level 5.0 supports up to 4096×2304 @ 30fps, providing headroom for 2400×960 @ 60fps.
 
+### iPhone AVE Encoder Identity (iPhone Syslog, Mar 2026)
+
+Runs 4-6 captured iPhone-side `idevicesyslog` during CarPlay sessions, revealing the encoder hardware:
+
+- **Hardware**: Apple Video Encoder (AVE) H9 variant (Apple Silicon A-series)
+- **Firmware**: AVE 905.29.1, compiled Feb 4, 2026 in prod
+- **Daemon**: `airplayd` (PID 591) — encoding runs in the AirPlay daemon, not the CarPlay app
+- **Profile/Level**: High Profile, Level 4.0 at 2400×788@30fps (vs Level 5.0 at 1920×1080@60fps in Jan 2026 captures)
+
+**AVCC (41 bytes) — identical across all sessions:**
+```
+01 64 00 28 ff e1 00 16 27 64 00 28 ac 13 14 50
+09 60 65 f9 e6 e0 21 a0 c0 da 08 84 65 80 01 00
+04 28 ee 3c b0 02 00 00 00
+```
+
+Decoded SPS fields: profile_idc=100 (High), level_idc=40 (4.0), chroma 4:2:0, bit depth 8/8, pic_order_cnt_type=0, no B-frames (I+P only stream confirmed).
+
+**800×480 thumbnail encoder phase**: Fresh AirPlay sessions start with a low-resolution 800×480 encoder (thumbnail/preview for adapter negotiation screen), switching to full resolution within 344ms. Warm reconnects skip this phase.
+
+### Pixel Software Encoder Identity (Logcat, Mar 2026)
+
+Android Auto uses `c2.google.avc.encoder` — Google **software** AVC encoder (CPU-based), not hardware. The Pixel has `c2.exynos.avc.encoder` (HW) but Gearhead selects the software codec for cross-device compatibility.
+
+| Parameter | Value |
+|-----------|-------|
+| Encoder | `c2.google.avc.encoder` |
+| Profile | Baseline (66), Constrained Baseline |
+| Level | 3.1 |
+| Entropy | CAVLC (Baseline mandates this) |
+| CSD size | **29 bytes** (vs CarPlay 33B — simpler SPS, no scaling lists/transform_8x8) |
+
+**CSD hex dump (identical across all 6 runs, all 10 sync events):**
+```
+00 00 00 01 67 42 40 1f e9 00 a0 0b 74 d4 04 04
+04 1e 10 08 54 00 00 00 01 68 ca 8f 20
+```
+
+**Two-phase configuration** (from Pixel `CCodecConfig`):
+1. **Phase 1 — Codec2 defaults**: 64 kbps placeholder, 1s sync-frame-interval
+2. **Phase 2 — Gearhead reconfigures**: 4.03 Mbps VBR, Baseline L3.1, `sync-frame-interval=60000000` μs (60s), 30fps, `prepend-sps-pps-to-idr-frames=0` (SPS/PPS sent separately)
+
 ### Typical Resolutions
 
 | Resolution | FPS | Use Case |
@@ -347,6 +389,46 @@ After sending an IDR, adapter may send type 0x3F1 to notify host.
 | Receives 0x3F1 | Yes | No |
 | Frame sync sent | Yes | No |
 
+### iPhone-Side ForceKeyFrame Behavior (iPhone Syslog, Mar 2026)
+
+The iPhone confirms every host `Command FRAME` via `airplayd(CoreUtils)`:
+```
+[0x148A] Force Key Frame, params: NULL
+```
+
+| Run | ForceKeyFrame Events | Host Command FRAME Count | Match |
+|-----|---------------------|--------------------------|-------|
+| 5 | 27 | 27 | Exact |
+| 6 | 26 | 26 | Exact |
+
+**CRITICAL**: ForceKeyFrame triggers a **complete AVE encoder restart** (Stop → Destroy → Create → Start), NOT a simple IDR insertion. The full cycle:
+1. FigVirtualFramebuffer source suspended
+2. `AVE_Plugin_AVC_Invalidate` → `AVE_Session_AVC_Stop`
+3. `AVE_Session_AVC_Destroy`
+4. `AVE_Plugin_AVC_CreateInstance` → `AVE_Session_AVC_Create`
+5. `AVE_Plugin_AVC_StartSession`
+6. FigVirtualFramebuffer source resumed
+
+This cycle takes ~3ms, visible as a brief PTS gap around each keyframe.
+
+**AirPlay RTSP control channel**: All keyframe requests flow via `POST /command RTSP/1.0`. Run 5: 55/55 requests at `200 OK`. Run 6: 53/53. Zero RTSP errors or timeouts across all runs.
+
+### Android Auto: NO Forced Keyframes (Mar 2026)
+
+**CRITICAL**: `Command FRAME` sent to an AA adapter causes the Pixel to **reset its entire projection UI**, NOT just the video encoder. This is fundamentally different from CarPlay where `Command FRAME` triggers a clean IDR.
+
+| Run | FRAME Commands | Trigger | Impact |
+|-----|---------------|---------|--------|
+| 1 | **1** (bug) | Watchdog zombie reset | Pixel UI reset, 540ms recovery |
+| 2 | **1** (bug) | Watchdog zombie reset | Pixel UI reset, 324ms recovery |
+| 3-6 | 0 | — | Correctly suppressed |
+
+- Runs 1-2 confirmed the UI reset — the watchdog reset code path incorrectly sent `Command FRAME` after zombie codec detection
+- Runs 3-6 correctly suppressed FRAME (0 commands sent)
+- **Natural IDR interval: 62-68s** (encoder `sync-frame-interval=60000000` μs)
+- No external keyframe control available — decoder must wait for next natural IDR
+- **Contrast with CarPlay**: 2s forced keyframe cycle via `Command FRAME` → AVE encoder restart
+
 ---
 
 ## Video Timing
@@ -375,6 +457,34 @@ Time(s)  | FPS   | Bitrate   | Activity
 Actual FPS range: 1.7-50.0, Avg: 27.1 fps
 ```
 
+### iPhone-Confirmed Frame Rate (Mar 2026)
+
+iPhone syslog (Runs 5-6) confirms frame rate is **content-dependent**, not fixed:
+
+| Metric | Value |
+|--------|-------|
+| Actual encode rate | 13–27 fps (varies per 2s interval) |
+| Encoder drops | **0** (all intervals, all runs) |
+| PTS grid | 33.33ms VSYNC intervals |
+| Frame submission | Variable — FigVirtualFramebuffer submits only on screen updates |
+
+The iPhone encoder processes every submitted frame without exception (`Drop: 0` across every 2-second reporting interval). All frame drops in the pipeline originate downstream — in the adapter USB transport, host staging buffer, or codec input buffer contention.
+
+### Android Auto Frame Rate (Pixel Logcat, Mar 2026)
+
+AA maintains a **fixed ~29.2fps mean** (range 28.8-30.0 in first 30-second windows), unlike CarPlay's variable content-driven rate:
+
+| Metric | Value |
+|--------|-------|
+| Mean FPS (first window) | **29.2 fps** (6 runs: 29.4, 29.1, 28.8, 30.0, 28.8, 29.0) |
+| Frame rate limiter | `FrameRateLimitManagerImpl` enforces 30fps ceiling |
+| Rate reduction | `PowerBasedLimiter`: 60→30fps at projection start |
+| PTS interval | **89% at 33ms**, 8% at 34ms — tighter than CarPlay (60%/30%) |
+| Late-window decline | 6.5-13.8fps when AA screen idle (fewer encoder frames) |
+| Frame drops | **Zero** during uninterrupted streaming across all 6 runs |
+
+The Pixel software encoder targets a fixed 30fps output rate, unlike the iPhone's VirtualFramebuffer which only submits frames on screen updates.
+
 ### Bitrate Statistics
 
 | Metric | Value |
@@ -386,6 +496,34 @@ Actual FPS range: 1.7-50.0, Avg: 27.1 fps
 | Peak (active content) | 4.3 Mbps |
 
 **Note:** Low average reflects variable frame rate - static screens consume minimal bandwidth.
+
+### iPhone-Confirmed Bitrate Control (DataRateLimits, Mar 2026)
+
+iPhone `airplayd(VideoProcessing)` reports real-time encoder bitrate via `DataRateLimits` property:
+
+| Phase | Target Bitrate | Duration |
+|-------|---------------|----------|
+| Session start floor | 750 Kbps | Initial |
+| Ramp | 1.0 → 1.5–1.8 Mbps | 1–2 seconds |
+| Steady state | 1.19–1.27 Mbps | Remainder |
+| Burst budget | 20% of target | Per-frame allowance |
+
+DataRateLimits format: `[targetBitrate, unknown, burstBitrate, burstWindow]` where `burstBitrate` = 20% of target.
+
+The steady-state 1.2 Mbps matches the 1.18 Mbps aggregate measured from host-side captures (section above), confirming the iPhone's bitrate controller is the authoritative rate limiter.
+
+### Android Auto Bitrate Configuration (Pixel Logcat, Mar 2026)
+
+AA bitrate is **fixed at Gearhead configuration time**, unlike CarPlay's adaptive algorithm:
+
+| Parameter | Value |
+|-----------|-------|
+| Gearhead target | **4.03 Mbps VBR** (`bitrate-mode=1`) |
+| Max bitrate | 4,034,400 bps (matches target) |
+| Adapter cap | `maxVideoBitRate = 5000 Kbps` (from web UI `bitRate=5`) |
+| Audio streams | MEDIA 48kHz stereo, TTS 16kHz mono, SYSTEM 16kHz mono |
+
+The adapter passes `maxVideoBitRate` to OpenAuto as a cap; the Pixel's Gearhead independently configures the encoder at 4.03 Mbps within that cap. Unlike CarPlay's DataRateLimits that update hundreds of times per session, AA bitrate is set once at projection start and does not adapt.
 
 ### vs Audio Independence
 
@@ -416,6 +554,29 @@ PPS: 00 00 00 01 68 ...  (NAL type 8)
 IDR: 00 00 00 01 65 ...  (NAL type 5)
 P-frame: 00 00 00 01 41 ... (NAL type 1)
 ```
+
+### Boot-Screen IDR Poisoning (Observed Mar 2026)
+
+Run 6 captured an abnormally small first IDR of **1,206 bytes** (vs typical 9–52KB). This is consistent with the iPhone encoder's 800×480 thumbnail/preview phase — the first IDR after session establishment may encode a boot-screen or low-resolution placeholder rather than the full CarPlay UI.
+
+**Impact**: All P-frames following a boot-screen IDR reference this low-quality frame, causing ~2 seconds of degraded output until the next ForceKeyFrame triggers a clean IDR at full resolution.
+
+**Mitigation**: `H264Renderer.flushOnNextIdr` — flush the codec on the second IDR to clear poisoned reference frames. This is decoder-side only; no adapter commands are involved.
+
+### Android Auto Boot-Screen IDR Poisoning (Mar 2026)
+
+AA boot-screen IDR poisoning is **deterministic and severe** — far worse than CarPlay's variable-size first IDR:
+
+| Metric | CarPlay | Android Auto |
+|--------|---------|-------------|
+| First IDR size | 1,206–90,549B (variable) | **2,735B (identical all 6 runs, all 10 sync events)** |
+| Bits/pixel | Variable | 0.024 bits/pixel — near-empty boot-screen |
+| Poisoning window | ~2s (next ForceKeyFrame clears) | **60-70s** (no forced keyframe mitigation) |
+| Natural IDR size | N/A (forced every 2s) | 49,792-58,654B (18-21× larger than boot-screen) |
+
+The 2,735B IDR encodes the AA startup animation — a nearly uniform dark background that compresses to <3KB for 921,600 pixels (1280×720). All subsequent P-frames reference this degenerate IDR until the next natural IDR at ~65 seconds.
+
+**`flushOnNextIdr` mechanism**: Flushes codec on the second IDR (the natural IDR at ~65s) to clear poisoned references. However, the flush **drops** that IDR — the next P-frames reference nothing, causing a brief glitch at the flush point. The watchdog then detects zombie codec (Rx:N Dec:0 for 2s) and triggers a reset + re-sync.
 
 ---
 
@@ -730,6 +891,33 @@ PPS: 68ca8f20 (4 bytes)
 5. **Android Auto more consistent** - Less frame timing variance
 6. **CarPlay higher bitrate** - 70% higher average bitrate for same resolution
 
+### Android Auto Quantitative Stream Data (Mar 2026, 6 Sessions)
+
+| Metric | Value |
+|--------|-------|
+| CSD size | 29B (Baseline Profile L3.1, CAVLC) |
+| First IDR | **2,735B deterministic** (all 6 runs, all 10 sync events) |
+| Steady-state FPS | 29.2 fps mean (28.8-30.0 first window) |
+| PTS stability | 89% at 33ms, 8% at 34ms |
+| Boot-to-streaming | 37-47s (mean 41s) |
+| BT→WiFi handoff | 3.0-3.2s typical (Run 2 outlier: 8.0s) |
+| Connection path | BT HFP → RFCOMM → WiFi Direct → Projection |
+| RFCOMM failures | 20-22 per run (structural, non-blocking, 5.5s retry cycle) |
+| RFCOMM UUID | `4de17a00-52cb-11e6-bdf4-0800200c9a66` |
+| WiFi link | 5GHz ch36, 144Mbps, RSSI -38 to -42, WPA2 |
+| Natural IDR interval | 62-68s (`sync-frame-interval=60s`) |
+| Sync→first-decode | 35.6ms average |
+| Frame drops (steady) | **Zero** during uninterrupted streaming |
+| Codec resets (pre-stream) | 2-4 per run (surface churn + connection retries) |
+| Watchdog triggers | Runs 1-2 only (boot-screen IDR poisoning) |
+
+**Connection timing breakdown (mean 41s):**
+- Adapter boot: ~12s (USB device enumeration)
+- USB connection + init: ~2-3s
+- BT discovery + RFCOMM: ~20-25s (dominated by RFCOMM retry failures)
+- BT→WiFi handoff: ~3s
+- WiFi→first video: <1s
+
 ### Video Header Comparison
 
 **Main Video Header (20 bytes):**
@@ -873,6 +1061,10 @@ STATUS:  Verified across all 10 captures (10/10)
 
 **Implication:** No need to request keyframe at session start. Decoder can initialize immediately on first packet.
 
+**Correction (Mar 2026):** While the first packet is always SPS+PPS+IDR, the first IDR may be a **boot-screen frame** (1,206B in Run 6 vs typical 9–52KB). This is the iPhone encoder's thumbnail/preview phase — not a full CarPlay UI render. The decoder initializes correctly but may display a degraded image for up to 2 seconds until the next ForceKeyFrame cycle.
+
+**AA-specific (Mar 2026):** AA first IDR is **always** 2,735B boot-screen (deterministic across all 6 runs, unlike CarPlay's variable 1,206–90,549B). The poisoning window extends to ~65 seconds (next natural IDR) because `Command FRAME` cannot be used for AA — it causes a full Pixel UI reset instead of an encoder-only keyframe.
+
 ### SPS/PPS Bundling Rule (CRITICAL)
 
 ```
@@ -938,6 +1130,8 @@ STATUS:  Verified across 538+ IDR frames
 | **IDR frames** | **49 KB** | 29 - 138 KB |
 | **P-frames** | **23 KB** | 0.4 - 134 KB |
 
+**iPhone-side confirmation (Mar 2026):** DataRateLimits steady-state of 1.19–1.27 Mbps = the 1.18 Mbps aggregate from host captures. At 30fps VSYNC, this yields ~5KB average P-frames, consistent with the observed distribution.
+
 ### Buffer Sizing Recommendations
 
 ```
@@ -1001,3 +1195,6 @@ Rule: Deep buffering (seconds) is counterproductive for projection video.
 - Session examples: `../04_Implementation/session_examples.md`
 - **Jan 2026 Wireless CarPlay capture:** `picarplay-capture_26JAN22_02-45-40` - TCP type 111 alt screen verified
 - **Jan 2026 Android Auto capture:** SSL handshake error codes verified (AaSdk logs)
+- **Mar 2026 CarPlay capture (Runs 1-6):** iPhone AVE encoder characterization, ForceKeyFrame lifecycle, DataRateLimits bitrate control, boot-screen IDR poisoning — see `video_pipeline_analysis/VIDEO_PIPELINE_DEEP_ANALYSIS.md`
+- **Mar 2026 iPhone syslog (Runs 4-6):** `idevicesyslog` capture confirming encoder identity, zero-drop behavior, RTSP 100% success rate
+- **Mar 2026 AA capture (Runs 1-6):** Pixel `c2.google.avc.encoder` characterization, boot-screen IDR poisoning, FRAME prohibition, RFCOMM instability, connection lifecycle — see `video_pipeline_analysis/AA_VIDEO_PIPELINE_DEEP_ANALYSIS.md`

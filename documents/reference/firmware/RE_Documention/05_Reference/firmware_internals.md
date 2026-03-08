@@ -174,6 +174,57 @@ String: `kAirPlayProperty_HIDHaptic` — supports haptic feedback relay to iPhon
 
 `setLimitedUI` — adapter signals the phone that the vehicle is in a restricted UI state (e.g., driving). CarPlay responds by simplifying its interface: shorter lists, larger tap targets, and restricted keyboard input.
 
+### AirPlay RTSP Control Channel (iPhone Syslog, Mar 2026)
+
+All AirPlay video control commands use HTTP-over-RTSP: `POST /command RTSP/1.0`. Run 5: 55/55 responses `200 OK`. Run 6: 53/53. Zero RTSP errors or timeouts — the control channel is completely reliable over the adapter's WiFi Direct link.
+
+### AirPlay Connection Statistics Format (Mar 2026)
+
+`airplayd(CoreUtils)` reports per-stream statistics in this format:
+```
+[0xE0C6] Connection statistics: I:604904/78/4652/337/6/9/5005 3111111110 IC:0 D:330*/752
+         T:16568830/1355/73643/427/113/164/74348
+```
+
+Stream `0xE0C6` (video): 604,904 input bytes per reporting interval. `D:330*/752` = 330 decoded outputs of 752 total, consistent with variable frame rate.
+
+### iPhone Error Sequence During Adapter Reboot (Mar 2026)
+
+When the adapter reboots mid-session, the iPhone logs a 6-step error sequence (~2s duration):
+
+1. **Network stall detected (10.1s)** — AirPlay detects no network activity
+2. **kCanceledErr (-6723)** — AirPlay session canceled
+3. **stream_SendMessageCreatingReply false** — pending messages fail
+4. **standardKeepAliveController error -16617** — keepalive timeout
+5. **Failed to connect to monitoring service** — post-disconnect cleanup
+6. **carEndpoint_copyNonStateProperty kCMBaseObjectError_PropertyNotFound** — stale endpoint
+
+After errors clear, the iPhone enters a **26-second HotSpot restart cycle** before a new AirPlay session can be established. iOS preserves the WiFi association during the reboot gap (`Preventing Disassociation`), enabling faster warm reconnects (23–24s from reboot to encoder start).
+
+### Android Auto Connection Lifecycle (Pixel Logcat, Mar 2026)
+
+AA connection follows a BT→WiFi handoff state machine, fundamentally different from CarPlay's AirPlay-only path:
+
+**State machine**: BT HFP → RFCOMM → WiFi Direct → Projection
+
+**Gearhead connection events** (from `GH.ConnLoggerV2`):
+- Events 805-806: SDP discovery, wireless setup start
+- Events 807, 815-816: HFP connecting, BT connected, wireless-capable BT connected
+- RFCOMM socket attempts (multiple failures before success)
+- WiFi Direct setup → Projection start
+
+| Metric | Value |
+|--------|-------|
+| BT→WiFi handoff | 3.0-3.2s typical (Run 2 outlier: 8.0s) |
+| RFCOMM UUID | `4de17a00-52cb-11e6-bdf4-0800200c9a66` |
+| RFCOMM failures | 20-22 per run (structural, non-blocking, 5.5s retry cycle) |
+| `bIgnoreVideoFocus` | `1` — adapter doesn't gate AA video on focus state |
+| Boot-to-streaming | 37-47s mean 41s |
+
+**Boot-to-streaming breakdown**: adapter boot ~12s, USB connection 2-3s, BT/RFCOMM 20-25s (dominated by retry failures), BT→WiFi handoff ~3s, WiFi→first video <1s.
+
+The RFCOMM failures are **structural** — they continue throughout the entire capture, even during active streaming. Gearhead never stops retrying RFCOMM connections. The connection succeeds through a separate path: the adapter initiates WiFi Direct independently of the RFCOMM attempts.
+
 ---
 
 ## CarPlay Audio Codec Support (r2 Analysis Feb 2026)
@@ -425,6 +476,51 @@ AudioConvertor → DMSDP RTP → CarPlay/Android Auto
 - `OmxVideoEncoder*` - encodes backup camera feed TO phone
 - Not used for CarPlay video FROM phone
 
+### iPhone AirPlay Encoder Lifecycle (iPhone Syslog, Mar 2026)
+
+iPhone syslog captures (Runs 4-6, `idevicesyslog`) revealed the complete AirPlay H.264 encoder lifecycle on-device:
+
+**Encoder**: Apple Video Encoder (AVE) H9 variant, firmware 905.29.1, running in `airplayd` daemon (PID 591).
+
+**8-stage session lifecycle:**
+```
+1. FigVirtualDisplaySession created (2 components: main + overlay)
+2. FigVirtualFramebufferClientSourceScreenCreateIOS (vfb source)
+3. AVE_Plugin_AVC_CreateInstance → AVE_Session_AVC_Create (ID assigned)
+4. AVE_Plugin_AVC_StartSession (resolution, HW address)
+5. AVE_Session_AVC_Prepare → encoding begins
+6. [streaming: 2s stats intervals, ForceKeyFrame triggers]
+7. AVE_Plugin_AVC_Invalidate → AVE_Session_AVC_Stop
+8. AVE_Session_AVC_Destroy → AVE_Plugin_AVC_Finalize (stats dump)
+```
+
+**800×480 thumbnail phase**: Fresh sessions start a low-res 800×480 encoder first (thumbnail for adapter negotiation), switching to full resolution within 344ms. Warm reconnects skip this phase.
+
+**Two vfb sources**: Source A (main CarPlay content, 120-122 frames per session), Source B (overlay/status bar, 49 frames — consistent across sessions).
+
+**ForceKeyFrame = full encoder restart**: Each host `Command FRAME` (every ~2s) triggers the complete Stop→Destroy→Create→Start cycle (stages 7→3→4→5), NOT a simple IDR insertion. ~3ms gap per restart.
+
+### Android Auto Encoder Architecture (Pixel Logcat, Mar 2026)
+
+AA uses a fundamentally different encoder architecture from CarPlay's hardware AVE:
+
+| Component | Value |
+|-----------|-------|
+| Encoder | `c2.google.avc.encoder` — Google **software** AVC (CPU-based) |
+| HW alternative | `c2.exynos.avc.encoder` exists on Pixel but Gearhead uses software codec for cross-device compatibility |
+| Audio codec | `c2.android.vorbis.decoder` for AA audio channel |
+
+**Gearhead creates 4 VirtualDisplays** for projection:
+
+| Display | Resolution | Purpose |
+|---------|-----------|---------|
+| `GhostActivityDisplay` | 1280x720 | Main projection surface → encoder input |
+| Maps | (projection child) | Maps/navigation surface |
+| `Dashboard` | 410x700 | Instrument cluster |
+| `GhFacetBar` | 80x720 | Side navigation bar |
+
+`GhostActivityDisplay` hosts `GmmCarProjectionService` — this is the surface that `c2.google.avc.encoder` encodes for transmission to the head unit. The software encoder runs on the Pixel's big cores for sustained encoding throughput.
+
 ---
 
 ## Hardware Codec Configuration
@@ -665,6 +761,30 @@ See `01_Firmware_Architecture/web_interface.md` for web server architecture and 
 - Strings: `### Send screen h264 frame data failed!` - sends raw H.264
 - Log: `recv CarPlay videoTimestamp:%llu` - timestamp forwarding only
 
+### iPhone-Side Measured Latencies (Mar 2026)
+
+| Transition | Duration | Source |
+|------------|----------|--------|
+| AirPlay session → encoder start | ~1s | iPhone syslog |
+| Bitrate ramp (750K → steady) | 1–2s | DataRateLimits |
+| Thumbnail → full resolution | 344ms | AVE StartSession logs |
+| ForceKeyFrame cycle (Stop→Start) | ~3ms | PTS gap analysis |
+| Network stall detection | 10.1s | AirPlay timeout |
+| HotSpot restart after reboot | 26s | iPhone WiFi logs |
+| Total reboot → encoder start | 23–24s | End-to-end measured |
+
+### Android Auto Measured Latencies (Mar 2026)
+
+| Transition | Duration | Source |
+|------------|----------|--------|
+| Boot-to-streaming (end-to-end) | 37-47s (mean 41s) | 6 runs measured |
+| BT→WiFi handoff | 3.0-3.2s (Run 2 outlier: 8.0s) | BT_CONNECTED→BT_DISCONNECTED |
+| Sync→first-decode | 35.6ms average | Sync gate to first decoded frame |
+| RFCOMM retry interval | 5.5s | Structural, continuous |
+| Natural IDR interval | 62-68s | `sync-frame-interval=60s` + encoding delay |
+| Watchdog zombie detection | 2s | Rx:N Dec:0 threshold |
+| FRAME recovery (when triggered) | 324-540ms | Runs 1-2 (FRAME→re-sync) |
+
 ### Video Resolution/FPS Limits (Binary Verified)
 
 **No hardcoded limits found.** The adapter forwards whatever the phone sends.
@@ -796,6 +916,29 @@ IsUsePhoneMic();              // External/app microphone check
 - Complex multi-stream mixing
 - Advanced real-time DSP beyond WebRTC
 - Multi-channel processing beyond basic routing
+
+### iPhone Encoder Boundaries (Confirmed Mar 2026)
+
+iPhone syslog captures confirm the processing boundary between iPhone and adapter:
+
+| Aspect | iPhone Behavior | Adapter/Host Control |
+|--------|----------------|---------------------|
+| Bitrate | Autonomous adaptive algorithm (750K floor, 20% burst budget) | VideoBitRate hint may be ignored |
+| Frame drops | **Zero** — encoder processes every submitted frame | All drops occur downstream |
+| Frame rate | Variable 13–27 fps, content-dependent | CustomFrameRate is ceiling, not target |
+| ForceKeyFrame | Only external control point — triggers full encoder restart | Host sends via Command FRAME (0x0C) |
+| Resolution | Set during AirPlay negotiation | Host specifies in Open message |
+
+### Pixel Encoder Boundaries (Confirmed Mar 2026)
+
+| Aspect | Pixel Behavior | Notes |
+|--------|---------------|-------|
+| Bitrate | 4.03 Mbps VBR (fixed at config time) | Adapter `maxVideoBitRate` acts as cap, not target |
+| Frame drops | **Zero** during uninterrupted streaming | All 6 runs, all steady-state windows |
+| Frame rate | ~29.2fps (`PowerBasedLimiter` enforced 30fps ceiling) | Declines to 6.5-13.8fps when idle |
+| ForceKeyFrame | **PROHIBITED** — causes full Pixel UI reset | NOT just encoder restart like CarPlay |
+| IDR interval | 60s (`sync-frame-interval=60000000` μs) | Measured 62-68s including encoding delay |
+| Resolution | 1280x720 (Gearhead configured) | `GhostActivityDisplay` → encoder surface |
 
 ---
 

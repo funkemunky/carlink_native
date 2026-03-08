@@ -2111,7 +2111,7 @@ link_type = fcn.00069874()
 
 #### Side Effects
 
-1. **Connection reset loop:** If CarLinkType doesn't match stored HU_LINK_TYPE → `"ResetConnection by HULink not match!!!"` → USB reset via `fcn.000234ac`. Can cause connect-reset-connect loop.
+1. **Connection reset loop:** If CarLinkType doesn't match stored HU_LINK_TYPE → `"ResetConnection by HULink not match!!!"` (0x0006f901) → USB reset via `fcn.000234ac`. Can cause connect-reset-connect loop. Preceded by `"Detect HULinktype changed by usb device plugin!!"` (0x00071653) when USB hotplug detects a device type change. Fallback string `"HULinkType_UNKOWN?"` (0x00070a62) used for unrecognized link types.
 2. **Auto-connect disable:** Any value != 30 bypasses NeedAutoConnect path entirely.
 3. **rfcomm bypass:** `/tmp/rfcomm_IAP2` and `/tmp/rfcomm_AAP` BT markers never checked when != 30.
 4. **USB_DEV_TYPE persistence:** Return value stored to `USB_DEV_TYPE` shared memory, propagated as HU_LINK_TYPE.

@@ -87,6 +87,28 @@ Hint for phone's encoder target bitrate (passed in Open message). Firmware appli
 | 6-15 | Medium bitrate (~1.5-3.75 Mbps effective) |
 | 16-20 | High bitrate (~4-5 Mbps effective) |
 
+#### iPhone-Measured Response to VideoBitRate (Mar 2026)
+
+iPhone syslog captures (`idevicesyslog`, Runs 4-6) reveal that the iPhone uses its **own adaptive bitrate algorithm**, independent of the firmware hint:
+
+| Phase | iPhone Behavior |
+|-------|----------------|
+| Session start | Always begins at **750 Kbps floor** regardless of VideoBitRate setting |
+| Ramp | Climbs to 1.5–1.8 Mbps within 1–2 seconds |
+| Steady state | Settles at 1.19–1.27 Mbps |
+| Burst budget | 20% of target bitrate (per-frame allowance for scene changes/IDRs) |
+
+The `DataRateLimits` property (`[target, unknown, burst, window]`) is updated hundreds of times per session (514 updates in Run 5, 488 in Run 6). The firmware VideoBitRate hint (passed in the Open message) may influence the iPhone's initial target but does NOT override the adaptive algorithm — the iPhone always converges to its own steady state based on WiFi link quality and content complexity.
+
+#### Android Auto Response to VideoBitRate (Mar 2026)
+
+AA bitrate behavior is fundamentally different from CarPlay's adaptive algorithm:
+
+- Adapter passes `maxVideoBitRate` to OpenAuto (e.g., 5000 Kbps from web UI `bitRate=5`)
+- Gearhead independently configures encoder at **4.03 Mbps VBR** — the adapter hint acts as a **cap**, not a target
+- Encoder uses VBR mode (`bitrate-mode=1`), `max-bitrate` = target bitrate (4,034,400 bps)
+- Unlike CarPlay's DataRateLimits that update hundreds of times per session, AA bitrate is **fixed at Gearhead configuration time** and does not adapt during streaming
+
 ### CustomFrameRate
 **Type:** Number (0, 20-60) | **Default:** 0
 
@@ -96,6 +118,26 @@ Sets `frameRate` field in Open message.
 |-------|--------|
 | 0 | Auto - typically 30 FPS |
 | 20-60 | Custom frame rate |
+
+#### iPhone-Confirmed Frame Rate Behavior (Mar 2026)
+
+iPhone syslog confirms that `CustomFrameRate` acts as a **ceiling, not a target**:
+
+- Actual encode rate: **13–27 fps** (content-dependent, varies per 2-second interval)
+- Encoder drops: **0** across every reporting interval in every run
+- The FigVirtualFramebuffer submits frames only when the CarPlay screen updates — static screens produce as few as 8 frames per 2-second cycle
+- The 30fps VSYNC grid (33ms PTS intervals) represents the display refresh rate, not the actual encode rate
+
+`CustomFrameRate=60` does NOT make the iPhone encode at 60fps — it allows up to 60fps during rapid animations, but the iPhone will still only encode frames when screen content changes.
+
+#### Android Auto Frame Rate Behavior (Mar 2026)
+
+AA frame rate control differs fundamentally from CarPlay:
+
+- Gearhead configures 30fps via `FrameRateLimitManagerImpl` (`PowerBasedLimiter`: 60→30fps)
+- `CustomFrameRate` setting has **no confirmed effect on AA** — Gearhead controls encoder fps independently of the adapter's frame rate hint
+- Actual output: ~29.2fps mean (28.8-30.0 first window), declining to 6.5-13.8fps when AA screen idle
+- Unlike CarPlay's variable content-driven rate, AA encoder maintains a **fixed 30fps target** during active content — only dropping when the screen is static
 
 ---
 

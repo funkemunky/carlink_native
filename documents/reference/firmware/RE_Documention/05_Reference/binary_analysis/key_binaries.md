@@ -1022,6 +1022,16 @@ CancelAutoConnect
 **iPhone Work Modes**: `AirPlay`, `OnlyCharge`, `iOSMirror`, `iPhoneWorkMode_UNKOWN?`
 **Android Work Modes**: `AndroidMirror`, `ICCOA`, `AndroidWorkMode_UNKOWN?`
 
+**Firmware "UNKOWN?" Fallback Strings** (5 distinct enums, all typos of "UNKNOWN"):
+
+| String | VA | Context |
+|--------|----|---------|
+| `iPhoneWorkMode_UNKOWN?` | `0x0006cb72` | iPhone daemon selector default (modes ≥5) |
+| `AndroidWorkMode_UNKOWN?` | `0x0006cc19` | Android daemon selector default (modes ≥6) |
+| `RiddleLinktype_UNKOWN?` | `0x0006da49` | Active link type enum default (MDLinkType JSON reporter + session handlers) |
+| `HULinkType_UNKOWN?` | `0x00070a62` | HU link type enum default |
+| `AudioSignal_UNKOWN?` | `0x0006dfd9` | Audio signal type enum default |
+
 ---
 
 ## Firmware Version Format

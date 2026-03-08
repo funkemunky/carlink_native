@@ -67,6 +67,7 @@ class VideoSurfaceView
             logInfo("[VIDEO_SURFACE_VIEW] Surface: ${width}x$height", tag = "UI")
 
             if (isSurfaceCreated) {
+                isSurfaceCreated = false
                 callback?.onSurfaceCreated(holder.surface, width, height)
             } else {
                 callback?.onSurfaceChanged(width, height)

@@ -150,3 +150,4 @@
 [83] :: Icon Thrashing fix, and more code cleanup
 [84] :: Log File export fixes
 [85] :: Testing Debug APK Only: Make app category 'HomeScreen' to replace GM Homescreen and freeup resources on GM Intel AAOS. Release APK: Instrument Cluster log level added
+[86] :: Single Keyframe Req for AA to correct anomaly at start of session. Some code cleanup and other video related fixes.

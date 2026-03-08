@@ -1709,6 +1709,20 @@ Offset  Size  Field        Description
 | 4 | HiCar |
 | 5 | ICCOA |
 
+### ProceessCmdOpen Work-Mode Dispatch (Binary Verified)
+
+Inside `ProceessCmdOpen` (`fcn.00021cb0`), the work-mode dispatch at `0x21e52-0x21e5e` is sequential:
+
+```arm
+0x21e52  ldr r0, [r6, 0x18]    ; phoneMode from Open message (offset 24)
+0x21e54  bl fcn.000176bc        ; OniPhoneWorkModeChanged(phoneMode) — iPhone daemons only
+0x21e58  bl fcn.00016640        ; read persisted /etc/android_work_mode (4-byte int)
+0x21e5c  movs r1, 0
+0x21e5e  bl fcn.0001777c        ; OnAndroidWorkModeChanged(persisted_mode, 0) — Android daemons
+```
+
+**Key insight:** The `phoneMode` field in the Open message controls ONLY the iPhone stack. The Android stack reads its mode from the persisted `/etc/android_work_mode` file (written via BoxSettings `"androidWorkMode"` key). The two systems are fully independent.
+
 ### HiCar DevList (0x0B subtype) — 32 bytes payload
 
 When sent as HiCar device list (via `fcn.00018850` at `0x18890`):

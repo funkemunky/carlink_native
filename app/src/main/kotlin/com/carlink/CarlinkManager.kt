@@ -195,6 +195,7 @@ class CarlinkManager(
 
     // Phone type tracking for frame interval decisions
     private var currentPhoneType: PhoneType? = null
+    private var aaInitialKeyframeSent = false
 
     // Auto-reconnect on USB disconnect
     private var reconnectJob: Job? = null
@@ -383,26 +384,17 @@ class CarlinkManager(
         // Set keyframe callback - after codec reset, we need to request a new IDR frame
         // from the adapter. Without SPS/PPS + keyframe, the decoder cannot produce output.
         h264Renderer?.setKeyframeRequestCallback {
-            logInfo("[KEYFRAME] Requesting keyframe after codec reset", tag = Logger.Tags.VIDEO)
-            adapterDriver?.sendCommand(CommandMapping.FRAME)
-        }
-
-        // Set CSD extraction callback — persist SPS/PPS for future codec pre-warming
-        h264Renderer?.setCsdExtractedCallback { sps, spsLen, pps, ppsLen ->
-            val btMac = connectedBtMac ?: return@setCsdExtractedCallback
-            val cacheKey = "${btMac}_${config.width}x${config.height}"
-            val prefs = context.getSharedPreferences("carlink_csd_cache", Context.MODE_PRIVATE)
-
-            val spsData = sps.copyOf(spsLen)
-            val ppsData = if (pps != null && ppsLen > 0) pps.copyOf(ppsLen) else ByteArray(0)
-
-            prefs.edit {
-                putString("sps_$cacheKey", android.util.Base64.encodeToString(spsData, android.util.Base64.NO_WRAP))
-                putString("pps_$cacheKey", android.util.Base64.encodeToString(ppsData, android.util.Base64.NO_WRAP))
+            if (currentPhoneType != PhoneType.ANDROID_AUTO || !aaInitialKeyframeSent) {
+                logInfo("[KEYFRAME] Requesting keyframe after codec reset", tag = Logger.Tags.VIDEO)
+                adapterDriver?.sendCommand(CommandMapping.FRAME)
+                if (currentPhoneType == PhoneType.ANDROID_AUTO) aaInitialKeyframeSent = true
+            } else {
+                logDebug("[KEYFRAME] Suppressed FRAME for AA (initial already sent)", tag = Logger.Tags.VIDEO)
             }
-
-            logInfo("[DEVICE] CSD cached for $cacheKey: SPS=${spsLen}B, PPS=${ppsLen}B", tag = Logger.Tags.VIDEO)
         }
+
+        // [CSD-CACHE DISABLED] CSD extraction callback removed for testing
+        // h264Renderer?.setCsdExtractedCallback { ... }
 
         // Start the H264 renderer to initialize MediaCodec and begin decoding
         // This MUST be called before feedDirect() - MediaCodec requires start() before queueInputBuffer()
@@ -626,6 +618,7 @@ class CarlinkManager(
         cancelReconnect() // Cancel any pending auto-reconnect
         negotiationRejected = false // Clear rejection flag for fresh connection
         currentPhoneType = null // Clear phone type on disconnect
+        aaInitialKeyframeSent = false
         clearCachedMediaMetadata() // Clear stale metadata to prevent race conditions on reconnect
         activeVoiceMode = VoiceMode.NONE // Reset voice mode on disconnect
         stopMicrophoneCapture()
@@ -711,6 +704,7 @@ class CarlinkManager(
             audioInitialized = false
         }
         currentPhoneType = null
+        aaInitialKeyframeSent = false
         activeVoiceMode = VoiceMode.NONE
         setState(State.DISCONNECTED)
     }
@@ -792,6 +786,9 @@ class CarlinkManager(
     fun onSurfaceDestroyed() {
         logInfo("[LIFECYCLE] Surface destroyed - pausing codec immediately", tag = Logger.Tags.VIDEO)
 
+        // Allow one FRAME on resume — codec will need a fresh IDR after restart
+        aaInitialKeyframeSent = false
+
         // Cancel any pending surface updates
         surfaceUpdateJob?.cancel()
         surfaceUpdateJob = null
@@ -856,7 +853,10 @@ class CarlinkManager(
 
         // Also request keyframe through adapter if connected
         if (state == State.STREAMING || state == State.DEVICE_CONNECTED) {
-            adapterDriver?.sendCommand(CommandMapping.FRAME)
+            if (currentPhoneType != PhoneType.ANDROID_AUTO || !aaInitialKeyframeSent) {
+                adapterDriver?.sendCommand(CommandMapping.FRAME)
+                if (currentPhoneType == PhoneType.ANDROID_AUTO) aaInitialKeyframeSent = true
+            }
         }
     }
 
@@ -1004,6 +1004,20 @@ class CarlinkManager(
                     setStatusText("Streaming")
                     // Safety net: ensure frame interval running when video starts
                     ensureFrameIntervalRunning()
+                    // AA: request one keyframe at session start to clear boot-screen poisoning.
+                    // The FRAME command gives us a clean IDR immediately — no flush needed.
+                    // Only schedule flush if we can't send FRAME (initial already sent).
+                    if (currentPhoneType == PhoneType.ANDROID_AUTO) {
+                        if (!aaInitialKeyframeSent) {
+                            aaInitialKeyframeSent = true
+                            adapterDriver?.sendCommand(CommandMapping.FRAME)
+                            logDebug("[VIDEO] AA stream: sent initial keyframe to clear boot-screen", tag = Logger.Tags.VIDEO)
+                        } else {
+                            // No FRAME available — schedule decoder-side flush on next natural IDR (~60s)
+                            h264Renderer?.setFlushOnNextIdr()
+                            logDebug("[VIDEO] AA stream: scheduled flush on next IDR", tag = Logger.Tags.VIDEO)
+                        }
+                    }
                 }
                 // Video data already processed directly by videoProcessor (DIRECT_HANDOFF)
             }
@@ -1046,7 +1060,7 @@ class CarlinkManager(
                     val btMac = message.json.optString("btMacAddr", "").ifEmpty { null }
                     if (btMac != null) {
                         connectedBtMac = btMac
-                        tryPrestageCodecCsd(btMac)
+                        // [CSD-CACHE DISABLED] tryPrestageCodecCsd(btMac)
                     }
                     logInfo(
                         "[DEVICE] Phone identified: model=$phoneModel, bt=$btMac",
@@ -1061,7 +1075,7 @@ class CarlinkManager(
                     if (deviceList.size == 1) {
                         val (mac, _) = deviceList[0]
                         connectedBtMac = mac
-                        tryPrestageCodecCsd(mac)
+                        // [CSD-CACHE DISABLED] tryPrestageCodecCsd(mac)
                     }
                 }
             }
@@ -1069,7 +1083,7 @@ class CarlinkManager(
             is PeerBluetoothAddressMessage -> {
                 connectedBtMac = message.macAddress
                 logInfo("[DEVICE] Peer BT address: ${message.macAddress}", tag = Logger.Tags.ADAPTR)
-                tryPrestageCodecCsd(message.macAddress)
+                // [CSD-CACHE DISABLED] tryPrestageCodecCsd(message.macAddress)
             }
 
             // Phase message — Phase 0 is a session termination signal (firmware kills AppleCarPlay)
@@ -1421,6 +1435,7 @@ class CarlinkManager(
 
         stopFrameInterval()
         currentPhoneType = null
+        aaInitialKeyframeSent = false
 
         // Set state to disconnected
         setState(State.DISCONNECTED)
@@ -1623,18 +1638,8 @@ class CarlinkManager(
         }
     }
 
-    private fun tryPrestageCodecCsd(btMac: String) {
-        val cacheKey = "${btMac}_${config.width}x${config.height}"
-        val prefs = context.getSharedPreferences("carlink_csd_cache", Context.MODE_PRIVATE)
-        val spsB64 = prefs.getString("sps_$cacheKey", null) ?: return
-        val ppsB64 = prefs.getString("pps_$cacheKey", null) ?: return
-
-        val sps = android.util.Base64.decode(spsB64, android.util.Base64.NO_WRAP)
-        val pps = android.util.Base64.decode(ppsB64, android.util.Base64.NO_WRAP)
-
-        logInfo("[DEVICE] CSD cache hit for $cacheKey — pre-warming codec", tag = Logger.Tags.VIDEO)
-        h264Renderer?.configureWithCsd(sps, pps)
-    }
+    // [CSD-CACHE DISABLED] tryPrestageCodecCsd — codec pre-warming removed for testing
+    // private fun tryPrestageCodecCsd(btMac: String) { ... }
 
     private fun parseDevList(json: JSONObject): List<Pair<String, String>> {
         val arr = json.optJSONArray("DevList") ?: return emptyList()

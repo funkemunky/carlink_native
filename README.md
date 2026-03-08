@@ -3,10 +3,17 @@
 Carlink is a **native** Kotlin code implementation from the original [Flutter-based](https://github.com/lvalen91/Carlink) app.
 I did this app for me and my use, but sharing so others can use it. Don't expect or demand support but I'll help where i can.
 
+### Requirments
+
+- For AAOS 12 and higher
+- For (Carlinkit CPC200-CCPA)[https://www.carlinkit.com/ccpa] on firmware 2025.10
+
+
 ## [XDA Developer Forums](https://xdaforums.com/t/carlink.4774308/)
 
 
 ## Work In progress - Something is always changing.. Not always good
+
 
 > [!IMPORTANT]
 >My 2024 Silverado gminfo3.7 Intel AAOS radio is the target Platform and my only hardware for testing. 
