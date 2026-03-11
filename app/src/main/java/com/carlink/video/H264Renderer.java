@@ -723,7 +723,7 @@ public class H264Renderer {
                     // or stopStaging() unparks for shutdown. park() consumes a permit, so an
                     // unpark racing just before this returns immediately and we re-poll — no
                     // lost frame. Spurious wakeups simply re-loop and re-poll.
-                    LockSupport.park();
+                    LockSupport.parkNanos(1_000_000L);  // 1ms — 0.5ms avg added latency
                 }
             }
         } catch (Exception e) {
