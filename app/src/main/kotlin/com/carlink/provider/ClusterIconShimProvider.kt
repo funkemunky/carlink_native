@@ -94,7 +94,7 @@ class ClusterIconShimProvider : ContentProvider() {
     override fun insert(
         uri: Uri,
         values: ContentValues?,
-    ): Uri? {
+    ): Uri {
         if (values == null) {
             Logger.w("insert() called with null ContentValues", tag = TAG)
             return "content://$AUTHORITY/img/empty".toUri()
