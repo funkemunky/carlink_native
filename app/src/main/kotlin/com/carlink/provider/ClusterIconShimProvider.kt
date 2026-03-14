@@ -33,7 +33,7 @@ class ClusterIconShimProvider : ContentProvider() {
     companion object {
         private const val TAG = Logger.Tags.ICON_SHIM
         private const val AUTHORITY =
-            "com.google.android.apps.automotive.templates.host.ClusterIconContentProvider"
+            "cc.funkemunky.carlink.apps.automotive.templates.host.ClusterIconContentProvider"
         private const val MAX_CACHE_SIZE = 20
     }
 
@@ -58,7 +58,7 @@ class ClusterIconShimProvider : ContentProvider() {
     override fun insert(
         uri: Uri,
         values: ContentValues?,
-    ): Uri? {
+    ): Uri {
         if (values == null) {
             Logger.w("insert() called with null ContentValues", tag = TAG)
             return "content://$AUTHORITY/img/empty".toUri()
