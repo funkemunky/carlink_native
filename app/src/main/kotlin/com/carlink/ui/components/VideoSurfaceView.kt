@@ -50,8 +50,7 @@ class VideoSurfaceView
         }
 
         @Suppress("ClickableViewAccessibility")
-        override fun onTouchEvent(event: MotionEvent): Boolean =
-            callback?.onTouchEvent(event) ?: super.onTouchEvent(event)
+        override fun onTouchEvent(event: MotionEvent): Boolean = callback?.onTouchEvent(event) ?: super.onTouchEvent(event)
 
         override fun surfaceCreated(holder: SurfaceHolder) {
             isSurfaceCreated = true
@@ -78,5 +77,4 @@ class VideoSurfaceView
             isSurfaceCreated = false
             callback?.onSurfaceDestroyed()
         }
-
     }

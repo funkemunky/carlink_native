@@ -69,6 +69,30 @@ public class H264Renderer {
     private int cachedPpsLength;
     private volatile boolean firstSpsAfterPrewarmFed;
 
+    // Android Auto mode — enables AA-specific decoder behaviors:
+    //   - Skip first N rendered frames (boot-screen IDR avoidance)
+    //   - Frame cache for replay recovery (60s IDR gap mitigation)
+    //   - VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING
+    private volatile boolean androidAutoMode = false;
+
+    // AA first-frame skip: decoded frames are released with render=false until this count
+    // reaches AA_RENDER_SKIP_COUNT. Prevents the deterministic 2,735B boot-screen IDR
+    // from ever displaying. AutoKit uses 4; we use the same threshold.
+    private static final int AA_RENDER_SKIP_COUNT = 4;
+    private final AtomicLong aaRenderedFrameCount = new AtomicLong(0);
+
+    // AA frame cache: stores frames since last IDR for replay on decoder recreation.
+    // With AA's 60s natural IDR interval, losing the decoder means 60s of corruption
+    // without cached frames to replay. AutoKit uses Vector capacity 320; we use a
+    // bounded array for GC-free operation.
+    private static final int FRAME_CACHE_MAX_FRAMES = 120;  // ~4s at 30fps
+    private static final int FRAME_CACHE_ENTRY_SIZE = 128 * 1024;  // 128KB per cached frame
+    private byte[][] frameCacheData;
+    private int[] frameCacheLengths;
+    private int frameCacheCount;
+    private byte[] frameCacheSps;  // SPS+PPS cache for replay (separate from codec CSD cache)
+    private int frameCacheSpsLength;
+
     private final AppExecutors executors;
     private final String preferredDecoderName;
 
@@ -175,6 +199,125 @@ public class H264Renderer {
         this.csdCallback = callback;
     }
 
+    /**
+     * Enable Android Auto decoder mode.
+     * Must be called before start() or during codec lifecycle for immediate effect.
+     * Enables: first-frame skip, frame cache replay, crop scaling mode.
+     */
+    public void setAndroidAutoMode(boolean enabled) {
+        this.androidAutoMode = enabled;
+        if (enabled) {
+            initFrameCache();
+        }
+        log("[VIDEO] Android Auto mode: " + enabled);
+    }
+
+    /** Allocate frame cache arrays (lazy, only for AA). */
+    private void initFrameCache() {
+        if (frameCacheData != null) return;
+        frameCacheData = new byte[FRAME_CACHE_MAX_FRAMES][];
+        frameCacheLengths = new int[FRAME_CACHE_MAX_FRAMES];
+        frameCacheCount = 0;
+        frameCacheSps = null;
+        frameCacheSpsLength = 0;
+    }
+
+    /** Clear frame cache (on IDR or decoder reset). */
+    private void clearFrameCache() {
+        frameCacheCount = 0;
+    }
+
+    /** Add a frame to the cache. On IDR, clears first. */
+    private void cacheFrame(byte[] data, int offset, int length, int nalType) {
+        if (frameCacheData == null) return;
+
+        // On IDR: clear cache and save SPS+PPS for replay prefix
+        if (nalType == NAL_IDR || nalType == NAL_SPS) {
+            clearFrameCache();
+            // If this is SPS bundle, extract SPS+PPS portion for replay
+            if (nalType == NAL_SPS) {
+                int idrOff = findNalOffset(data, offset + 4, length - 4, NAL_IDR);
+                if (idrOff > 0) {
+                    int spsLen = idrOff - offset;
+                    if (frameCacheSps == null || frameCacheSps.length < spsLen) {
+                        frameCacheSps = new byte[spsLen];
+                    }
+                    System.arraycopy(data, offset, frameCacheSps, 0, spsLen);
+                    frameCacheSpsLength = spsLen;
+                }
+            }
+        }
+
+        if (frameCacheCount >= FRAME_CACHE_MAX_FRAMES) return;  // Cache full, stop adding
+
+        int idx = frameCacheCount;
+        if (frameCacheData[idx] == null || frameCacheData[idx].length < length) {
+            frameCacheData[idx] = new byte[Math.max(length, FRAME_CACHE_ENTRY_SIZE)];
+        }
+        System.arraycopy(data, offset, frameCacheData[idx], 0, length);
+        frameCacheLengths[idx] = length;
+        frameCacheCount++;
+    }
+
+    /**
+     * Replay cached frames through the codec after decoder recreation.
+     * Feeds SPS+PPS first, then all cached frames since last IDR.
+     * AutoKit replays up to 20 iterations for AA — we do a single pass
+     * since our async codec pipeline handles warmup differently.
+     */
+    private void replayFrameCache() {
+        if (frameCacheData == null || frameCacheCount == 0) return;
+        if (mCodec == null || !running) return;
+
+        log("[VIDEO] Replaying " + frameCacheCount + " cached frames for AA recovery");
+
+        // Feed cached SPS+PPS first if available
+        if (frameCacheSps != null && frameCacheSpsLength > 0) {
+            Integer spsIdx = codecAvailableBufferIndexes.poll();
+            if (spsIdx != null) {
+                try {
+                    ByteBuffer buf = mCodec.getInputBuffer(spsIdx);
+                    if (buf != null) {
+                        buf.clear();
+                        buf.put(frameCacheSps, 0, frameCacheSpsLength);
+                        mCodec.queueInputBuffer(spsIdx, 0, frameCacheSpsLength,
+                                frameCounter.getAndIncrement(), MediaCodec.BUFFER_FLAG_CODEC_CONFIG);
+                    } else {
+                        codecAvailableBufferIndexes.offer(spsIdx);
+                    }
+                } catch (Exception e) {
+                    codecAvailableBufferIndexes.offer(spsIdx);
+                    log("[VIDEO] Frame cache SPS replay error: " + e.getMessage());
+                }
+            }
+        }
+
+        // Feed each cached frame
+        for (int i = 0; i < frameCacheCount; i++) {
+            Integer idx = codecAvailableBufferIndexes.poll();
+            if (idx == null) {
+                log("[VIDEO] Frame cache replay: no input buffer at frame " + i + "/" + frameCacheCount);
+                break;
+            }
+            try {
+                ByteBuffer buf = mCodec.getInputBuffer(idx);
+                if (buf != null) {
+                    buf.clear();
+                    buf.put(frameCacheData[i], 0, frameCacheLengths[i]);
+                    mCodec.queueInputBuffer(idx, 0, frameCacheLengths[i],
+                            frameCounter.getAndIncrement(), 0);
+                    feedSuccesses.incrementAndGet();
+                } else {
+                    codecAvailableBufferIndexes.offer(idx);
+                }
+            } catch (Exception e) {
+                codecAvailableBufferIndexes.offer(idx);
+                log("[VIDEO] Frame cache replay error at " + i + ": " + e.getMessage());
+                break;
+            }
+        }
+    }
+
     private void log(String message) {
         logCallback.log("H264_RENDERER", message);
     }
@@ -195,6 +338,8 @@ public class H264Renderer {
         firstFrameLogged = false;
         syncAcquired = false;
         firstSpsAfterPrewarmFed = false;
+        aaRenderedFrameCount.set(0);
+        if (androidAutoMode) clearFrameCache();
 
         log("start - " + width + "x" + height);
 
@@ -279,6 +424,11 @@ public class H264Renderer {
             stop();
             this.surface = savedSurface;
             start();
+
+            // AA: replay cached frames through fresh decoder for faster recovery
+            if (androidAutoMode) {
+                replayFrameCache();
+            }
         }
 
         if (keyframeCallback != null) {
@@ -317,6 +467,11 @@ public class H264Renderer {
             stop();
             this.surface = newSurface;
             start();
+
+            // AA: replay cached frames through fresh decoder for faster recovery
+            if (androidAutoMode) {
+                replayFrameCache();
+            }
         }
 
         if (keyframeCallback != null) {
@@ -324,6 +479,29 @@ public class H264Renderer {
                 keyframeCallback.onKeyframeNeeded();
             } catch (Exception e) {
                 log("[VIDEO_ERROR] Keyframe request failed: " + e);
+            }
+        }
+    }
+
+    /**
+     * Flush the codec to release stalled BufferQueue output buffers.
+     * Used when the SurfaceView is re-exposed after being covered by an overlay
+     * (settings screen). Unlike Activity onStop/onStart, overlays don't trigger
+     * lifecycle events, so the codec may stall while SurfaceFlinger isn't consuming.
+     *
+     * After flush, the codec needs a new IDR to resume decoding. The caller should
+     * request a keyframe from the adapter (for CarPlay) or wait for natural IDR (AA).
+     */
+    public void flushCodec() {
+        synchronized (codecLock) {
+            if (!running || mCodec == null) return;
+            try {
+                mCodec.flush();
+                mCodec.start();
+                codecAvailableBufferIndexes.clear();
+                log("[LIFECYCLE] Codec flushed (overlay recovery)");
+            } catch (Exception e) {
+                log("[LIFECYCLE] Codec flush failed: " + e.getMessage());
             }
         }
     }
@@ -543,6 +721,17 @@ public class H264Renderer {
         mCodec.setCallback(codecCallback);
         codecAvailableBufferIndexes.clear();
         mCodec.configure(mediaformat, surface, null, 0);
+
+        // AA: crop-scale to fit letterboxed content (removes black bars at codec level)
+        if (androidAutoMode) {
+            try {
+                mCodec.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING);
+                log("AA video scaling: SCALE_TO_FIT_WITH_CROPPING");
+            } catch (Exception e) {
+                log("AA scaling mode not supported: " + e.getMessage());
+            }
+        }
+
         log("Surface bound: valid=" + (surface != null && surface.isValid()));
     }
 
@@ -738,6 +927,12 @@ public class H264Renderer {
             inputBuffer.put(frame.data, 0, frame.length);
             mCodec.queueInputBuffer(index, 0, frame.length, frame.timestamp, 0);
             feedSuccesses.incrementAndGet();
+
+            // AA frame cache: store frames since last IDR for replay on decoder recreation
+            if (androidAutoMode) {
+                int nt = getNalType(frame.data, 0, frame.length);
+                cacheFrame(frame.data, 0, frame.length, nt);
+            }
         } catch (Exception e) {
             long count = feedExceptionCount.incrementAndGet();
             lastFeedException = e.getClass().getSimpleName() + ": " + e.getMessage();
@@ -1036,7 +1231,22 @@ public class H264Renderer {
                 }
 
                 try {
-                    mCodec.releaseOutputBuffer(index, info.size != 0);
+                    // AA first-frame skip: don't render the first N decoded frames.
+                    // The AA boot-screen IDR (2,735B) decodes to a nearly-uniform dark frame.
+                    // All P-frames reference it, producing corrupt video. By skipping the first
+                    // 4 rendered frames (matching AutoKit's behavior), we avoid ever displaying
+                    // the boot screen and let the codec warm up before rendering begins.
+                    boolean shouldRender = info.size != 0;
+                    if (shouldRender && androidAutoMode) {
+                        long renderCount = aaRenderedFrameCount.incrementAndGet();
+                        if (renderCount <= AA_RENDER_SKIP_COUNT) {
+                            shouldRender = false;
+                            if (renderCount == AA_RENDER_SKIP_COUNT) {
+                                log("[VIDEO] AA warmup complete — rendering enabled");
+                            }
+                        }
+                    }
+                    mCodec.releaseOutputBuffer(index, shouldRender);
                 } catch (Exception e) {
                     // Ignore
                 }

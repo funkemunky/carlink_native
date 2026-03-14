@@ -26,11 +26,12 @@ import com.carlink.protocol.AudioDataMessage
 import com.carlink.protocol.BoxSettingsMessage
 import com.carlink.protocol.CommandMapping
 import com.carlink.protocol.CommandMessage
+import com.carlink.protocol.InfoMessage
 import com.carlink.protocol.MediaDataMessage
 import com.carlink.protocol.MediaType
-import com.carlink.protocol.InfoMessage
 import com.carlink.protocol.Message
 import com.carlink.protocol.MessageSerializer
+import com.carlink.protocol.MultiTouchAction
 import com.carlink.protocol.NaviFocusMessage
 import com.carlink.protocol.PeerBluetoothAddressMessage
 import com.carlink.protocol.PhaseMessage
@@ -48,9 +49,6 @@ import com.carlink.usb.UsbDeviceWrapper
 import com.carlink.util.AppExecutors
 import com.carlink.util.LogCallback
 import com.carlink.video.H264Renderer
-import java.util.Timer
-import java.util.TimerTask
-import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -60,6 +58,9 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.util.Timer
+import java.util.TimerTask
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Main Carlink Manager
@@ -90,6 +91,9 @@ class CarlinkManager(
 
         // Surface debouncing - wait for size to stabilize before updating codec
         private const val SURFACE_DEBOUNCE_MS = 150L
+
+        // AA touch throttling interval (AutoKit uses 17ms / ~60fps)
+        private const val AA_TOUCH_THROTTLE_NS = 17_000_000L
     }
 
     /**
@@ -125,7 +129,21 @@ class CarlinkManager(
         fun onStatusTextChanged(text: String)
 
         fun onHostUIPressed()
+
+        /** Called when phone type becomes known (PLUGGED) or cleared (disconnect/error). */
+        fun onPhoneTypeChanged(phoneType: PhoneType) {}
     }
+
+    /**
+     * AA center-crop parameters for TextureView matrix transform and touch remapping.
+     * Null when not applicable (CarPlay, 16:9 display, or no config yet).
+     */
+    data class AaCropParams(
+        val tierWidth: Int,
+        val tierHeight: Int,
+        val contentHeight: Int,
+        val cropTop: Int,
+    )
 
     // Coroutine scope for async operations
     private val scope = CoroutineScope(Dispatchers.Main)
@@ -157,6 +175,23 @@ class CarlinkManager(
     private var h264Renderer: H264Renderer? = null
     private var videoSurface: Surface? = null
     private var lastVideoDiscardWarningTime = 0L // Throttle discard warnings
+
+    /** True once we've inferred phone type from video header (mid-session rejoin). */
+    private var videoPhoneTypeInferred = false
+
+    /** True when codec start is deferred until phone type is known (PLUGGED or video inference). */
+    private var codecDeferred = true
+
+    /** Actual video surface dimensions (may differ from config due to Compose inset behavior). */
+    private var actualSurfaceWidth = 0
+    private var actualSurfaceHeight = 0
+
+    // Video state from adapter header — tracked for AA touch flags (AutoKit packs these in touch payload)
+    // encoderType: 1=H264, 2=H265(default/initial), 4=MJPEG
+    // offScreen: 0=on-screen, 1=off-screen
+    @Volatile private var videoEncoderType = 2
+
+    @Volatile private var videoOffScreen = 0
 
     // Audio
     private var audioManager: DualStreamAudioManager? = null
@@ -221,8 +256,9 @@ class CarlinkManager(
     private var lastIsPlaying: Boolean = true
 
     // Device identification for SPS/PPS caching
-    private var deviceList: List<Pair<String, String>> = emptyList()  // (btMac, type) from BoxSettings #1
-    private var connectedBtMac: String? = null                        // from PeerBluetoothAddress
+    private var deviceList: List<Pair<String, String>> = emptyList() // (btMac, type) from BoxSettings #1
+    private var connectedBtMac: String? = null // from PeerBluetoothAddress
+
     /** Clears cached media metadata to prevent stale data on reconnect. */
     private fun clearCachedMediaMetadata() {
         lastMediaSongName = null
@@ -242,21 +278,28 @@ class CarlinkManager(
     private val executors = AppExecutors()
 
     // LogCallback for Java components — routes to Logger with proper tags
-    private val logCallback = object : LogCallback {
-        override fun log(message: String) {
-            this@CarlinkManager.log(message)
-        }
+    private val logCallback =
+        object : LogCallback {
+            override fun log(message: String) {
+                this@CarlinkManager.log(message)
+            }
 
-        override fun log(tag: String, message: String) {
-            Logger.d(message, tag)
-        }
-
-        override fun logPerf(tag: String, message: String) {
-            if (Logger.isDebugLoggingEnabled() && Logger.isTagEnabled(tag)) {
+            override fun log(
+                tag: String,
+                message: String,
+            ) {
                 Logger.d(message, tag)
             }
+
+            override fun logPerf(
+                tag: String,
+                message: String,
+            ) {
+                if (Logger.isDebugLoggingEnabled() && Logger.isTagEnabled(tag)) {
+                    Logger.d(message, tag)
+                }
+            }
         }
-    }
 
     /**
      * Initialize the manager with a Surface and actual surface dimensions.
@@ -278,6 +321,12 @@ class CarlinkManager(
         // Round to even numbers for H.264 compatibility
         val evenWidth = surfaceWidth and 1.inv()
         val evenHeight = surfaceHeight and 1.inv()
+
+        // Track actual surface dims for AA crop/touch calculations
+        val prevSurfaceWidth = actualSurfaceWidth
+        val prevSurfaceHeight = actualSurfaceHeight
+        actualSurfaceWidth = evenWidth
+        actualSurfaceHeight = evenHeight
 
         // Config resolution was pre-computed from stable WindowMetrics in MainActivity.
         // Do NOT override with surface dimensions — SurfaceView size oscillates during
@@ -336,8 +385,26 @@ class CarlinkManager(
 
                     this@CarlinkManager.callback = finalCallback
                     this@CarlinkManager.videoSurface = finalSurface
-                    // Resume with new surface - this calls setOutputSurface() internally
-                    h264Renderer?.resume(finalSurface)
+
+                    // If container dimensions changed during an AA session, resend
+                    // BoxSettings so the phone re-renders for the new content area.
+                    // prevSurfaceWidth/Height captured before actualSurface* was overwritten.
+                    val dimsChanged =
+                        prevSurfaceWidth > 0 && prevSurfaceHeight > 0 &&
+                            (prevSurfaceWidth != pendingSurfaceWidth || prevSurfaceHeight != pendingSurfaceHeight)
+                    if (dimsChanged && currentPhoneType == PhoneType.ANDROID_AUTO) {
+                        resendBoxSettings()
+                        // Notify UI so oversized surface recalculates for new crop params
+                        callback?.onPhoneTypeChanged(PhoneType.ANDROID_AUTO)
+                    }
+
+                    if (codecDeferred && currentPhoneType != null) {
+                        // AA resize complete — start codec with the new oversized surface
+                        startCodecIfDeferred()
+                    } else if (!codecDeferred) {
+                        // Resume with new surface - this calls setOutputSurface() internally
+                        h264Renderer?.resume(finalSurface)
+                    }
                 }
             return
         }
@@ -364,8 +431,11 @@ class CarlinkManager(
         logInfo(
             "[PLATFORM] Using VideoDecoder: " +
                 "${platformInfo.hardwareH264DecoderName ?: "generic (createDecoderByType)"}" +
-                if (platformInfo.requiresIntelMediaCodecFixes())
-                    " [Intel VPU workaround enabled]" else "",
+                if (platformInfo.requiresIntelMediaCodecFixes()) {
+                    " [Intel VPU workaround enabled]"
+                } else {
+                    ""
+                },
             tag = Logger.Tags.VIDEO,
         )
 
@@ -404,11 +474,14 @@ class CarlinkManager(
             logInfo("[DEVICE] CSD cached for $cacheKey: SPS=${spsLen}B, PPS=${ppsLen}B", tag = Logger.Tags.VIDEO)
         }
 
-        // Start the H264 renderer to initialize MediaCodec and begin decoding
-        // This MUST be called before feedDirect() - MediaCodec requires start() before queueInputBuffer()
-        h264Renderer?.start()
+        // Defer codec start until phone type is known (PLUGGED message).
+        // For AA, the UI will resize the SurfaceView to tier AR first (oversized + clip),
+        // which triggers surface destruction/creation. Starting the codec AFTER the resize
+        // avoids the 60s black screen from losing the active decoder's IDR reference.
+        // For CarPlay, the codec starts immediately at PLUGGED since no resize is needed.
+        codecDeferred = true
 
-        logInfo("Video subsystem initialized and ready for decoding", tag = Logger.Tags.VIDEO)
+        logInfo("Video subsystem initialized, codec deferred until phone type known", tag = Logger.Tags.VIDEO)
 
         // Initialize audio manager with platform-specific config
         audioManager =
@@ -426,11 +499,12 @@ class CarlinkManager(
 
         // Initialize GNSS forwarder for GPS → adapter → CarPlay pipeline (only if enabled)
         if (config.gpsForwarding) {
-            gnssForwarder = GnssForwarder(
-                context = context,
-                sendGnssData = { adapterDriver?.sendGnssData(it) ?: false },
-                logCallback = ::log,
-            )
+            gnssForwarder =
+                GnssForwarder(
+                    context = context,
+                    sendGnssData = { adapterDriver?.sendGnssData(it) ?: false },
+                    logCallback = ::log,
+                )
         }
 
         // Initialize MediaSession only for ADAPTER audio mode (not Bluetooth)
@@ -504,8 +578,14 @@ class CarlinkManager(
         setState(State.CONNECTING)
         setStatusText("Searching for adapter...")
 
-        // Reset video renderer (only if initialized)
-        h264Renderer?.reset()
+        // Reset video renderer (only if initialized and codec is active).
+        // When codecDeferred=true (fresh init or reconnect), skip reset — the codec
+        // will be started by startCodecIfDeferred() at PLUGGED time with the correct
+        // surface. Calling reset() here would prematurely start the codec before the
+        // surface has stabilized (Compose layout may destroy/recreate the SurfaceView).
+        if (!codecDeferred) {
+            h264Renderer?.reset()
+        }
 
         // Initialize audio
         if (!audioInitialized) {
@@ -586,7 +666,7 @@ class CarlinkManager(
         log("[INIT] Audio mode: ${if (refreshedConfig.audioTransferMode) "BLUETOOTH" else "ADAPTER"}")
 
         setStatusText("Initializing adapter...")
-        adapterDriver?.start(refreshedConfig, initMode.name, pendingChanges)
+        adapterDriver?.start(refreshedConfig, initMode.name, pendingChanges, actualSurfaceWidth, actualSurfaceHeight)
         setStatusText("Waiting for phone...")
 
         // Mark first init completed, store version, and clear pending changes after successful start
@@ -626,6 +706,11 @@ class CarlinkManager(
         cancelReconnect() // Cancel any pending auto-reconnect
         negotiationRejected = false // Clear rejection flag for fresh connection
         currentPhoneType = null // Clear phone type on disconnect
+        videoPhoneTypeInferred = false
+        codecDeferred = true // Reset for next connection
+        videoEncoderType = 2 // Reset to H265/initial
+        videoOffScreen = 0
+        callback?.onPhoneTypeChanged(PhoneType.UNKNOWN)
         clearCachedMediaMetadata() // Clear stale metadata to prevent race conditions on reconnect
         activeVoiceMode = VoiceMode.NONE // Reset voice mode on disconnect
         stopMicrophoneCapture()
@@ -684,16 +769,52 @@ class CarlinkManager(
      */
     private fun sendKey(command: CommandMapping): Boolean = adapterDriver?.sendCommand(command) ?: false
 
+    // AA touch throttling: AutoKit throttles MOVE events to 17ms (~60fps) intervals.
+    // This reduces USB traffic without perceptible input lag.
+    @Volatile private var lastAaTouchSendTimeNs = 0L
+
     /**
-     * Send a multi-touch event.
+     * Send a multi-touch event (CarPlay) or single-touch event (Android Auto).
+     * AA uses type 0x05 with 0..10000 ints; CarPlay uses type 0x17 with 0..1 floats.
      * Dispatched to IO — USB bulkTransfer must never block the UI thread.
+     *
+     * AA MOVE events are throttled to 17ms intervals (matching AutoKit behavior).
+     * DOWN and UP are always sent immediately.
      */
-    fun sendMultiTouch(
-        touches: List<MessageSerializer.TouchPoint>,
-    ) {
+    fun sendMultiTouch(touches: List<MessageSerializer.TouchPoint>) {
         val driver = adapterDriver ?: return
+        val isAA = currentPhoneType == PhoneType.ANDROID_AUTO
         scope.launch(Dispatchers.IO) {
-            driver.sendMultiTouch(touches)
+            if (isAA && touches.isNotEmpty()) {
+                // AA: send primary pointer as single-touch (type 0x05, 0..10000 ints)
+                val primary = touches.first()
+
+                // Throttle MOVE events to 17ms intervals (AutoKit compatibility)
+                if (primary.action == MultiTouchAction.MOVE) {
+                    val now = System.nanoTime()
+                    if (now - lastAaTouchSendTimeNs < AA_TOUCH_THROTTLE_NS) return@launch
+                    lastAaTouchSendTimeNs = now
+                }
+
+                val xi = (primary.x * 10000).toInt()
+                val yi = (primary.y * 10000).toInt()
+                if (BuildConfig.DEBUG) {
+                    logDebug(
+                        "[AA_TOUCH] type=0x05 action=${primary.action} x=$xi y=$yi" +
+                            " (norm=${primary.x},${primary.y})",
+                        tag = Logger.Tags.TOUCH,
+                    )
+                }
+                driver.sendSingleTouch(
+                    x = xi,
+                    y = yi,
+                    action = primary.action,
+                    encoderType = videoEncoderType,
+                    offScreen = videoOffScreen,
+                )
+            } else {
+                driver.sendMultiTouch(touches)
+            }
         }
     }
 
@@ -710,7 +831,9 @@ class CarlinkManager(
             audioManager?.release()
             audioInitialized = false
         }
+        codecDeferred = true // Reset for next connection
         currentPhoneType = null
+        callback?.onPhoneTypeChanged(PhoneType.UNKNOWN)
         activeVoiceMode = VoiceMode.NONE
         setState(State.DISCONNECTED)
     }
@@ -805,6 +928,87 @@ class CarlinkManager(
     }
 
     /**
+     * Start the codec if it was deferred. Called when:
+     * - PLUGGED(CarPlay): start immediately with current surface
+     * - AA surface resize complete: new surface available at tier AR
+     * - Video arrives before PLUGGED: fallback start with current surface
+     */
+    fun startCodecIfDeferred() {
+        if (!codecDeferred) return
+        val renderer = h264Renderer ?: return
+        // Use CarlinkManager.videoSurface (updated by debounce) — NOT renderer's
+        // internal surface, which may be null if surfaceDestroyed/Created happened
+        // during Compose layout after initialize() but before PLUGGED arrived.
+        val surface = videoSurface
+        if (surface == null || !surface.isValid) {
+            logWarn(
+                "[LIFECYCLE] Deferred codec start skipped — no valid surface",
+                tag = Logger.Tags.VIDEO,
+            )
+            return // Leave codecDeferred=true; debounce or resumeVideo() will retry
+        }
+        codecDeferred = false
+        logInfo("[LIFECYCLE] Starting deferred codec", tag = Logger.Tags.VIDEO)
+        renderer.resume(surface)
+    }
+
+    /**
+     * Swap the video surface without re-initializing the full pipeline.
+     * Used when switching between SurfaceView (CarPlay) and TextureView (AA).
+     * Bypasses the debounce — the caller already knows this is the final surface.
+     */
+    fun swapSurface(surface: Surface) {
+        logInfo("[LIFECYCLE] swapSurface() — replacing video surface", tag = Logger.Tags.VIDEO)
+        surfaceUpdateJob?.cancel()
+        surfaceUpdateJob = null
+        this.videoSurface = surface
+        h264Renderer?.resume(surface)
+    }
+
+    /**
+     * Compute AA center-crop parameters from the current adapter config.
+     * Returns null for CarPlay, 16:9 displays, or when config has no native dims.
+     * Uses config.width/height (video surface dims) to match serializeBoxSettings AR calc.
+     */
+    fun getAaCropParams(): AaCropParams? {
+        // Use actual surface dims (ground truth from Compose layout), not config dims
+        // (which come from WindowMetrics and may differ due to AAOS dock inset behavior).
+        val surfW = if (actualSurfaceWidth > 0) actualSurfaceWidth else config.width
+        val surfH = if (actualSurfaceHeight > 0) actualSurfaceHeight else config.height
+        if (surfW <= 0 || surfH <= 0) return null
+
+        val (tierWidth, tierHeight) =
+            when {
+                surfW >= 1920 -> Pair(1920, 1080)
+                surfW >= 1280 -> Pair(1280, 720)
+                else -> Pair(800, 480)
+            }
+        val displayAR = surfW.toFloat() / surfH.toFloat()
+        val contentHeight = ((tierWidth.toFloat() / displayAR).toInt() and 0xFFFE).coerceAtMost(tierHeight)
+        if (contentHeight >= tierHeight) return null // 16:9 or narrower — no crop needed
+        val cropTop = (tierHeight - contentHeight) / 2
+        return AaCropParams(tierWidth, tierHeight, contentHeight, cropTop)
+    }
+
+    /**
+     * Resend BoxSettings to the adapter with current surface dimensions.
+     * Called when display mode changes during an AA session so the phone
+     * re-renders content for the new container size.
+     */
+    fun resendBoxSettings() {
+        val driver = adapterDriver ?: return
+        val w = actualSurfaceWidth
+        val h = actualSurfaceHeight
+        if (w <= 0 || h <= 0) return
+        logInfo(
+            "[LIFECYCLE] Resending BoxSettings for new surface ${w}x$h",
+            tag = Logger.Tags.VIDEO,
+        )
+        val msg = MessageSerializer.serializeBoxSettings(config, surfaceWidth = w, surfaceHeight = h)
+        scope.launch(Dispatchers.IO) { driver.send(msg) }
+    }
+
+    /**
      * Pause video decoding when app goes to background.
      *
      * On AAOS, when the app is covered by another app (e.g., Maps, Phone), the Surface
@@ -858,6 +1062,18 @@ class CarlinkManager(
         if (state == State.STREAMING || state == State.DEVICE_CONNECTED) {
             adapterDriver?.sendCommand(CommandMapping.FRAME)
         }
+    }
+
+    /**
+     * Recover video after settings overlay closes.
+     * Flushes the codec to release stalled BufferQueue buffers, then requests
+     * a keyframe (CarPlay only — AA keyframe resets phone UI).
+     */
+    fun recoverVideoFromOverlay() {
+        if (state != State.STREAMING) return
+        logInfo("[LIFECYCLE] Recovering video after overlay close", tag = Logger.Tags.VIDEO)
+        h264Renderer?.flushCodec()
+        adapterDriver?.sendCommand(CommandMapping.FRAME)
     }
 
     // ==================== Private Methods ====================
@@ -966,6 +1182,19 @@ class CarlinkManager(
                 currentPhoneType = message.phoneType
                 logDebug("[PLUGGED] Stored currentPhoneType=$currentPhoneType", tag = Logger.Tags.VIDEO)
 
+                // Set AA mode on renderer for AA-specific behaviors:
+                // first-frame skip, frame cache replay, crop scaling mode
+                h264Renderer?.setAndroidAutoMode(message.phoneType == PhoneType.ANDROID_AUTO)
+
+                // For CarPlay: start codec now (no surface resize needed).
+                // For AA: onPhoneTypeChanged triggers UI resize → surfaceDestroyed/Created →
+                // debounce path calls startCodecIfDeferred() with the new oversized surface.
+                if (message.phoneType != PhoneType.ANDROID_AUTO) {
+                    startCodecIfDeferred()
+                }
+
+                callback?.onPhoneTypeChanged(message.phoneType)
+
                 // Start frame interval for CarPlay
                 // This periodic keyframe request keeps video streaming stable
                 ensureFrameIntervalRunning()
@@ -1002,8 +1231,16 @@ class CarlinkManager(
                     logInfo("Video streaming started (direct processing)", tag = Logger.Tags.VIDEO)
                     setState(State.STREAMING)
                     setStatusText("Streaming")
-                    // Safety net: ensure frame interval running when video starts
-                    ensureFrameIntervalRunning()
+
+                    if (currentPhoneType == PhoneType.ANDROID_AUTO) {
+                        // AA needs one keyframe request at session start to stabilize video.
+                        // Unlike CarPlay, AA must NOT receive periodic FRAME commands (resets phone UI).
+                        val sent = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
+                        logInfo("[FRAME_INTERVAL] AA one-shot keyframe request sent=$sent", tag = Logger.Tags.VIDEO)
+                    } else {
+                        // Safety net: ensure frame interval running when video starts (CarPlay only)
+                        ensureFrameIntervalRunning()
+                    }
                 }
                 // Video data already processed directly by videoProcessor (DIRECT_HANDOFF)
             }
@@ -1160,8 +1397,11 @@ class CarlinkManager(
 
         // Write audio with offset+length to avoid copy
         audioManager?.writeAudio(
-            audioData, message.audioDataOffset, message.audioDataLength,
-            message.audioType, message.decodeType,
+            audioData,
+            message.audioDataOffset,
+            message.audioDataLength,
+            message.audioType,
+            message.decodeType,
         )
     }
 
@@ -1387,8 +1627,9 @@ class CarlinkManager(
 
         // Detect whether metadata actually changed (song change or new album cover)
         // Position-only ticks (~95% of messages) skip the expensive metadata path
-        val metadataChanged = (newSongName != null && newSongName != previousSongName) ||
-            albumCover != null
+        val metadataChanged =
+            (newSongName != null && newSongName != previousSongName) ||
+                albumCover != null
 
         if (metadataChanged) {
             // Full metadata update (title/artist/album/cover/duration)
@@ -1420,7 +1661,9 @@ class CarlinkManager(
         logError("Adapter error: $error", tag = Logger.Tags.ADAPTR)
 
         stopFrameInterval()
+        codecDeferred = true // Reset for next connection
         currentPhoneType = null
+        callback?.onPhoneTypeChanged(PhoneType.UNKNOWN)
 
         // Set state to disconnected
         setState(State.DISCONNECTED)
@@ -1602,18 +1845,78 @@ class CarlinkManager(
      */
     private fun createVideoProcessor(): UsbDeviceWrapper.VideoDataProcessor {
         return object : UsbDeviceWrapper.VideoDataProcessor {
-            override fun processVideoDirect(data: ByteArray, dataLength: Int, sourcePtsMs: Int) {
-                val renderer = h264Renderer ?: run {
-                    // Data already read by UsbDeviceWrapper — just discard by returning
-                    val now = System.currentTimeMillis()
-                    if (now - lastVideoDiscardWarningTime > 2000) {
-                        lastVideoDiscardWarningTime = now
-                        logWarn("Video frame discarded - H264Renderer not initialized.", tag = Logger.Tags.VIDEO)
+            override fun processVideoDirect(
+                data: ByteArray,
+                dataLength: Int,
+                sourcePtsMs: Int,
+            ) {
+                val renderer =
+                    h264Renderer ?: run {
+                        // Data already read by UsbDeviceWrapper — just discard by returning
+                        val now = System.currentTimeMillis()
+                        if (now - lastVideoDiscardWarningTime > 2000) {
+                            lastVideoDiscardWarningTime = now
+                            logWarn("Video frame discarded - H264Renderer not initialized.", tag = Logger.Tags.VIDEO)
+                        }
+                        return
                     }
-                    return
+
+                // Start codec on first video if still deferred (PLUGGED arrived but was CarPlay,
+                // or fallback for protocols that send video before PLUGGED).
+                if (codecDeferred) {
+                    startCodecIfDeferred()
                 }
 
                 logVideoUsb { "processVideoDirect: dataLength=$dataLength, pts=$sourcePtsMs" }
+
+                // Parse encoder state from video header for touch flags (AutoKit compatibility).
+                // Offset 8: flags field. Bit 0 = offScreen, bits 2-3 = encoderType (0→H264, 1→H265, 2→MJPEG).
+                if (dataLength >= 12) {
+                    val flags =
+                        (data[8].toInt() and 0xFF) or ((data[9].toInt() and 0xFF) shl 8) or
+                            ((data[10].toInt() and 0xFF) shl 16) or ((data[11].toInt() and 0xFF) shl 24)
+                    videoOffScreen = flags and 1
+                    val rawEncoder = (flags shr 2) and 3
+                    videoEncoderType =
+                        when (rawEncoder) {
+                            0 -> 2
+
+                            // H265
+                            1 -> 1
+
+                            // H264
+                            2 -> 4
+
+                            // MJPEG
+                            else -> 2
+                        }
+                }
+
+                // Infer phone type from video header if PLUGGED was missed (mid-session rejoin).
+                // Video header: [0..3]=width, [4..7]=height (LE int32). AA tiers are exactly
+                // 800x480, 1280x720, or 1920x1080. CarPlay uses arbitrary display dims.
+                if (!videoPhoneTypeInferred && currentPhoneType == null && dataLength >= 8) {
+                    videoPhoneTypeInferred = true
+                    val w =
+                        (data[0].toInt() and 0xFF) or ((data[1].toInt() and 0xFF) shl 8) or
+                            ((data[2].toInt() and 0xFF) shl 16) or ((data[3].toInt() and 0xFF) shl 24)
+                    val h =
+                        (data[4].toInt() and 0xFF) or ((data[5].toInt() and 0xFF) shl 8) or
+                            ((data[6].toInt() and 0xFF) shl 16) or ((data[7].toInt() and 0xFF) shl 24)
+                    val isAaTier = (w == 1920 && h == 1080) || (w == 1280 && h == 720) || (w == 800 && h == 480)
+                    if (isAaTier) {
+                        logInfo("[VIDEO] Inferred ANDROID_AUTO from video header ${w}x$h (mid-session)", tag = Logger.Tags.VIDEO)
+                        currentPhoneType = PhoneType.ANDROID_AUTO
+                        h264Renderer?.setAndroidAutoMode(true)
+                        callback?.onPhoneTypeChanged(PhoneType.ANDROID_AUTO)
+                    } else {
+                        logInfo("[VIDEO] Inferred CARPLAY from video header ${w}x$h (mid-session)", tag = Logger.Tags.VIDEO)
+                        currentPhoneType = PhoneType.CARPLAY
+                        h264Renderer?.setAndroidAutoMode(false)
+                        callback?.onPhoneTypeChanged(PhoneType.CARPLAY)
+                        ensureFrameIntervalRunning()
+                    }
+                }
 
                 // Skip 20-byte video header, feed H.264 data directly to codec
                 if (dataLength > 20) {
