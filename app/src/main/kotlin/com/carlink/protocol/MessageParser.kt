@@ -1,6 +1,7 @@
 package com.carlink.protocol
 
 import com.carlink.audio.AudioFormats
+import com.carlink.logging.Logger
 import com.carlink.logging.logWarn
 import org.json.JSONException
 import org.json.JSONObject
@@ -145,7 +146,7 @@ object MessageParser {
             // but if it arrives here (no videoProcessor), parse as info
             MessageType.NAVI_VIDEO_DATA -> InfoMessage(header, "NaviVideoData", "${header.length}B")
 
-            else -> UnknownMessage(header)
+            else -> UnknownMessage(header, payload)
         }
 
     private fun parseAudioData(
@@ -153,7 +154,7 @@ object MessageParser {
         payload: ByteArray?,
     ): Message {
         if (payload == null || header.length < 12) {
-            return UnknownMessage(header)
+            return UnknownMessage(header, payload)
         }
 
         val buffer = ByteBuffer.wrap(payload, 0, header.length).order(ByteOrder.LITTLE_ENDIAN)
@@ -175,6 +176,7 @@ object MessageParser {
                     command = AudioCommand.fromId(commandId),
                     data = null,
                     volumeDuration = null,
+                    rawCommandId = commandId,
                 )
             }
 
@@ -234,7 +236,8 @@ object MessageParser {
 
         val mediaPayload: Map<String, Any> =
             when (mediaType) {
-                MediaType.ALBUM_COVER -> {
+                MediaType.ALBUM_COVER,
+                MediaType.ALBUM_COVER_AA -> {
                     val imageData = ByteArray(header.length - 4)
                     System.arraycopy(payload, 4, imageData, 0, imageData.size)
                     mapOf("AlbumCover" to imageData)
@@ -262,14 +265,28 @@ object MessageParser {
                             val json = JSONObject(jsonString)
                             json.keys().asSequence().associateWith { json.get(it) }
                         } catch (e: JSONException) {
-                            logWarn("[MessageParser] Failed to parse media metadata JSON: ${e.message}")
+                            val rawPreview = try {
+                                val raw = ByteArray(header.length - 5)
+                                System.arraycopy(payload, 4, raw, 0, raw.size)
+                                String(raw, StandardCharsets.UTF_8).take(256)
+                            } catch (_: Exception) { "(unreadable)" }
+                            logWarn(
+                                "[MessageParser] Failed to parse media JSON: ${e.message} raw=$rawPreview",
+                                Logger.Tags.PROTO_UNKNOWN,
+                            )
                             emptyMap()
                         }
                     }
                 }
 
                 else -> {
-                    emptyMap()
+                    // Unknown subtype — preserve raw bytes for diagnostic logging
+                    val preview = if (header.length > 4) {
+                        val limit = (header.length - 4).coerceAtMost(64)
+                        payload.drop(4).take(limit).joinToString(" ") { "%02X".format(it) } +
+                            if (header.length - 4 > 64) " … (${header.length - 4}B total)" else ""
+                    } else ""
+                    mapOf("_unknownSubtype" to typeInt, "_hexPreview" to preview)
                 }
             }
 
@@ -306,7 +323,7 @@ object MessageParser {
                 null
             }
 
-        return PluggedMessage(header, phoneType, wifi)
+        return PluggedMessage(header, phoneType, wifi, rawPhoneType = phoneTypeId)
     }
 
     private fun parseBoxSettings(
@@ -314,13 +331,13 @@ object MessageParser {
         payload: ByteArray?,
     ): Message {
         if (payload == null || header.length < 2) {
-            return UnknownMessage(header)
+            return UnknownMessage(header, payload)
         }
 
         // Payload is null-terminated JSON string
         val jsonString = String(payload, 0, header.length, StandardCharsets.UTF_8).trim('\u0000')
         if (jsonString.isEmpty()) {
-            return UnknownMessage(header)
+            return UnknownMessage(header, payload)
         }
 
         return try {
@@ -330,7 +347,7 @@ object MessageParser {
             BoxSettingsMessage(header, json, isPhoneInfo)
         } catch (e: JSONException) {
             logWarn("[MessageParser] Failed to parse BoxSettings JSON: ${e.message}")
-            UnknownMessage(header)
+            UnknownMessage(header, payload)
         }
     }
 
@@ -339,7 +356,7 @@ object MessageParser {
         payload: ByteArray?,
     ): Message {
         if (payload == null || header.length < 17) {
-            return UnknownMessage(header)
+            return UnknownMessage(header, payload)
         }
 
         // Payload is 17 bytes ASCII MAC "XX:XX:XX:XX:XX:XX" (may be null-terminated)
@@ -426,11 +443,22 @@ sealed class Message(
 
 /**
  * Unknown or unhandled message type.
+ * Preserves raw payload bytes for diagnostic logging.
  */
 class UnknownMessage(
     header: MessageHeader,
+    val rawPayload: ByteArray? = null,
 ) : Message(header) {
-    override fun toString(): String = "UnknownMessage(type=0x${header.rawType.toString(16)}, ${header.length}B)"
+    /** First 64 bytes as hex for log output. */
+    fun hexPreview(): String {
+        if (rawPayload == null || rawPayload.isEmpty()) return "(no payload)"
+        val limit = header.length.coerceAtMost(64)
+        val hex = rawPayload.take(limit).joinToString(" ") { "%02X".format(it) }
+        return if (header.length > 64) "$hex … (${header.length}B total)" else hex
+    }
+
+    override fun toString(): String =
+        "UnknownMessage(type=0x${header.rawType.toString(16)}, ${header.length}B, ${hexPreview()})"
 }
 
 /**
@@ -457,8 +485,15 @@ class PluggedMessage(
     header: MessageHeader,
     val phoneType: PhoneType,
     val wifi: Int?,
+    /** Raw phone type integer from wire — preserved even when phoneType maps to UNKNOWN */
+    val rawPhoneType: Int = phoneType.id,
 ) : Message(header) {
-    override fun toString(): String = "Plugged(phoneType=${phoneType.name}, wifi=$wifi)"
+    override fun toString(): String =
+        if (phoneType == PhoneType.UNKNOWN) {
+            "Plugged(phoneType=UNKNOWN rawId=$rawPhoneType / 0x${rawPhoneType.toString(16)}, wifi=$wifi)"
+        } else {
+            "Plugged(phoneType=${phoneType.name}, wifi=$wifi)"
+        }
 }
 
 /**
@@ -483,6 +518,8 @@ class AudioDataMessage(
     val volumeDuration: Float?,
     val audioDataOffset: Int = 0,
     val audioDataLength: Int = data?.size ?: 0,
+    /** Raw command byte from wire — preserved even when command maps to UNKNOWN */
+    val rawCommandId: Int = command?.id ?: -1,
 ) : Message(header) {
     override fun toString(): String {
         val format = AudioFormats.fromDecodeType(decodeType)

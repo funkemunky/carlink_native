@@ -310,7 +310,8 @@ class AdapterDriver(
                             messageHandler(VideoStreamingSignal)
                         } catch (e: Exception) {
                             receiveErrors.incrementAndGet()
-                            log("Message handler error: ${e.message}")
+                            val trace = e.stackTraceToString().take(500)
+                            log("VideoStreamingSignal handler error: ${e.message}\n$trace")
                         }
                         return
                     }
@@ -329,7 +330,8 @@ class AdapterDriver(
                         messageHandler(message)
                     } catch (e: Exception) {
                         receiveErrors.incrementAndGet()
-                        log("Message handler error: ${e.message}")
+                        val trace = e.stackTraceToString().take(500)
+                        log("Message handler error for $message: ${e.message}\n$trace")
                     }
                 }
 

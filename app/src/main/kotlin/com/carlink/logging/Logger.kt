@@ -49,6 +49,9 @@ object Logger {
         const val CLUSTER = "CLUSTER"
         const val ICON_SHIM = "ICON_SHIM"
 
+        /** Protocol unknowns — bypasses ALL tag/level filtering. Always reaches file logs. */
+        const val PROTO_UNKNOWN = "PROTO_UNKNOWN"
+
         // Video Pipeline Debug Tags
         const val VIDEO_USB = "VIDEO_USB"
         const val VIDEO_RING_BUFFER = "VIDEO_RING"
@@ -250,8 +253,12 @@ object Logger {
         }
 
         // Apply filtering only for listeners (file logging, etc.)
-        if (level.priority < minLevel.priority) return
-        if (tag != null && !isTagEnabled(tag)) return
+        // NEVER filter protocol-unknown messages — they must always reach file logs
+        val bypassFilter = tag == Tags.PROTO_UNKNOWN
+        if (!bypassFilter) {
+            if (level.priority < minLevel.priority) return
+            if (tag != null && !isTagEnabled(tag)) return
+        }
 
         for (listener in listeners) {
             try {

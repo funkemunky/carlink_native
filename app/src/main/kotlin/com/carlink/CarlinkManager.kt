@@ -162,6 +162,18 @@ class CarlinkManager(
     private val currentState = AtomicReference(State.DISCONNECTED)
     val state: State get() = currentState.get()
 
+    // Session-scoped unknown data counters — reset on connect, dumped on disconnect
+    private var unknownMessageTypeCount = 0
+    private var unknownMediaSubtypeCount = 0
+    private var unknownCommandCount = 0
+    private var unknownAudioCommandCount = 0
+    private var unknownPhoneTypeCount = 0
+    private var unknownBoxSettingsKeyCount = 0
+    private val unknownMessageTypes = mutableSetOf<Int>()     // raw type IDs seen
+    private val unknownMediaSubtypes = mutableSetOf<Int>()    // raw subtype IDs seen
+    private val unknownCommandIds = mutableSetOf<Int>()       // raw command IDs seen
+    private val unknownAudioCommandIds = mutableSetOf<Int>()  // raw audio cmd IDs seen
+
     // Callback
     private var callback: Callback? = null
 
@@ -604,6 +616,7 @@ class CarlinkManager(
 
         setState(State.CONNECTING)
         setStatusText("Searching for adapter...")
+        resetUnknownCounters()
 
         // Reset video renderer (only if initialized and codec is active).
         // When codecDeferred=true (fresh init or reconnect), skip reset — the codec
@@ -777,6 +790,7 @@ class CarlinkManager(
             logInfo("Audio released on stop", tag = Logger.Tags.AUDIO)
         }
 
+        dumpUnknownSummary()
         setState(State.DISCONNECTED)
     }
 
@@ -1212,6 +1226,14 @@ class CarlinkManager(
                     "[PLUGGED] Device plugged: phoneType=${message.phoneType}, wifi=${message.wifi}",
                     tag = Logger.Tags.VIDEO,
                 )
+                if (message.phoneType == PhoneType.UNKNOWN) {
+                    unknownPhoneTypeCount++
+                    logWarn(
+                        "[PLUGGED] Unknown phoneType raw id=${message.rawPhoneType} " +
+                            "(0x${message.rawPhoneType.toString(16)})",
+                        tag = Logger.Tags.PROTO_UNKNOWN,
+                    )
+                }
                 clearPairTimeout()
                 stopFrameInterval() // Stop any existing timer (clean slate)
 
@@ -1327,9 +1349,11 @@ class CarlinkManager(
                     setStatusText("Phone found — connecting...")
                     logDebug("[CMD] ${message.command.name}", tag = Logger.Tags.ADAPTR)
                 } else if (message.command == CommandMapping.INVALID) {
+                    unknownCommandCount++
+                    unknownCommandIds.add(message.rawId)
                     logWarn(
                         "[CMD] Unknown command id=${message.rawId} (0x${message.rawId.toString(16)})",
-                        tag = Logger.Tags.ADAPTR,
+                        tag = Logger.Tags.PROTO_UNKNOWN,
                     )
                 } else {
                     logDebug(
@@ -1363,6 +1387,30 @@ class CarlinkManager(
                         connectedBtMac = mac
                         tryPrestageCodecCsd(mac)
                     }
+                }
+
+                // Detect unknown JSON keys from adapter firmware updates
+                val knownKeys = setOf(
+                    "uuid", "MFD", "boxType", "OemName", "productType", "hwVersion",
+                    "supportLinkType", "WiFiChannel", "DevList", "ver", "mfd",
+                    "MDModel", "btMacAddr", "buildModel", "iOSVer", "linkType",
+                    "boxName", "wifiName", "btName", "oemIconLabel", "wifiPasswd",
+                    "androidWorkMode", "phoneMode", "DashboardInfo",
+                    "AndroidAutoSizeW", "AndroidAutoSizeH", "naviScreenInfo",
+                    "AdvancedFeatures", "GNSSCapability", "callQuality",
+                )
+                val unknownKeys = message.json.keys().asSequence()
+                    .filter { it !in knownKeys }
+                    .toList()
+                if (unknownKeys.isNotEmpty()) {
+                    unknownBoxSettingsKeyCount += unknownKeys.size
+                    val preview = unknownKeys.joinToString { key ->
+                        "$key=${message.json.opt(key)}"
+                    }
+                    logWarn(
+                        "[BOX_SETTINGS] Unknown keys: $preview",
+                        tag = Logger.Tags.PROTO_UNKNOWN,
+                    )
                 }
             }
 
@@ -1431,17 +1479,19 @@ class CarlinkManager(
             }
 
             is UnknownMessage -> {
+                unknownMessageTypeCount++
+                unknownMessageTypes.add(message.header.rawType)
                 logWarn(
                     "[UNKNOWN] Unrecognized message type=0x${message.header.rawType.toString(16)} " +
-                        "(${message.header.length}B)",
-                    tag = Logger.Tags.ADAPTR,
+                        "(${message.header.length}B) payload=${message.hexPreview()}",
+                    tag = Logger.Tags.PROTO_UNKNOWN,
                 )
             }
         }
 
         // Handle audio commands for mic capture
         if (message is AudioDataMessage && message.command != null) {
-            handleAudioCommand(message.command, message.decodeType)
+            handleAudioCommand(message.command, message.decodeType, message.rawCommandId)
         }
     }
 
@@ -1472,7 +1522,7 @@ class CarlinkManager(
         )
     }
 
-    private fun handleAudioCommand(command: AudioCommand, messageDecodeType: Int = 5) {
+    private fun handleAudioCommand(command: AudioCommand, messageDecodeType: Int = 5, rawCommandId: Int = command.id) {
         logDebug(
             "[AUDIO_CMD] ${command.name} (id=${command.id} purpose=$currentStreamPurpose)",
             tag = Logger.Tags.AUDIO,
@@ -1588,7 +1638,12 @@ class CarlinkManager(
             }
 
             AudioCommand.UNKNOWN -> {
-                logWarn("[AUDIO_CMD] Unknown audio command id=${command.id}", tag = Logger.Tags.AUDIO)
+                unknownAudioCommandCount++
+                unknownAudioCommandIds.add(rawCommandId)
+                logWarn(
+                    "[AUDIO_CMD] Unknown audio command rawId=$rawCommandId (0x${rawCommandId.toString(16)})",
+                    tag = Logger.Tags.PROTO_UNKNOWN,
+                )
             }
         }
     }
@@ -1698,6 +1753,39 @@ class CarlinkManager(
                     logWarn("[NAVI_ICON] NAVI_IMAGE message with no image data", tag = Logger.Tags.NAVI)
                 }
             }
+            return
+        }
+
+        // Android Auto album art arrives as a standalone MEDIA_DATA subtype 2 message (PNG).
+        // Cache it and push a metadata update so MediaSession gets the cover immediately,
+        // without waiting for the next subtype-1 JSON tick which carries no image bytes.
+        if (message.type == MediaType.ALBUM_COVER_AA) {
+            val coverBytes = message.payload["AlbumCover"] as? ByteArray
+            if (coverBytes != null) {
+                lastAlbumCover = coverBytes
+                mediaSessionManager?.updateMetadata(
+                    title = lastMediaSongName,
+                    artist = lastMediaArtistName,
+                    album = lastMediaAlbumName,
+                    appName = lastMediaAppName,
+                    albumArt = lastAlbumCover,
+                    duration = lastDuration,
+                )
+            }
+            return
+        }
+
+        // Unknown MediaData subtype — log everything for protocol discovery
+        if (message.type == MediaType.UNKNOWN) {
+            unknownMediaSubtypeCount++
+            val subtype = message.payload["_unknownSubtype"]
+            if (subtype is Int) unknownMediaSubtypes.add(subtype)
+            val hex = message.payload["_hexPreview"] ?: ""
+            logWarn(
+                "[MEDIA_UNKNOWN] Unrecognized MediaData subtype=$subtype " +
+                    "(${message.header.length}B) payload=$hex",
+                tag = Logger.Tags.PROTO_UNKNOWN,
+            )
             return
         }
 
@@ -2146,5 +2234,43 @@ class CarlinkManager(
 
     private fun log(message: String) {
         logDebug(message, tag = Logger.Tags.ADAPTR)
+    }
+
+    private fun resetUnknownCounters() {
+        unknownMessageTypeCount = 0
+        unknownMediaSubtypeCount = 0
+        unknownCommandCount = 0
+        unknownAudioCommandCount = 0
+        unknownPhoneTypeCount = 0
+        unknownBoxSettingsKeyCount = 0
+        unknownMessageTypes.clear()
+        unknownMediaSubtypes.clear()
+        unknownCommandIds.clear()
+        unknownAudioCommandIds.clear()
+    }
+
+    private fun dumpUnknownSummary() {
+        val total = unknownMessageTypeCount + unknownMediaSubtypeCount +
+            unknownCommandCount + unknownAudioCommandCount +
+            unknownPhoneTypeCount + unknownBoxSettingsKeyCount
+        if (total == 0) return
+
+        val parts = mutableListOf<String>()
+        if (unknownMessageTypeCount > 0)
+            parts += "msgTypes=${unknownMessageTypeCount}x${unknownMessageTypes.map { "0x${it.toString(16)}" }}"
+        if (unknownMediaSubtypeCount > 0)
+            parts += "mediaSubtypes=${unknownMediaSubtypeCount}x$unknownMediaSubtypes"
+        if (unknownCommandCount > 0)
+            parts += "commands=${unknownCommandCount}x${unknownCommandIds.map { "0x${it.toString(16)}" }}"
+        if (unknownAudioCommandCount > 0)
+            parts += "audioCmds=${unknownAudioCommandCount}x$unknownAudioCommandIds"
+        if (unknownPhoneTypeCount > 0)
+            parts += "phoneTypes=${unknownPhoneTypeCount}x"
+        if (unknownBoxSettingsKeyCount > 0)
+            parts += "boxSettingsKeys=${unknownBoxSettingsKeyCount}x"
+        logWarn(
+            "[SESSION_SUMMARY] Unknown data received this session ($total total): ${parts.joinToString(", ")}",
+            tag = Logger.Tags.PROTO_UNKNOWN,
+        )
     }
 }

@@ -13,6 +13,7 @@ import android.hardware.usb.UsbManager
 import androidx.core.content.ContextCompat
 import com.carlink.logging.Logger
 import com.carlink.logging.logDebug
+import com.carlink.logging.logWarn
 import com.carlink.protocol.KnownDevices
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
@@ -453,13 +454,21 @@ class UsbDeviceWrapper(
                             com.carlink.protocol.MessageParser
                                 .parseHeader(headerBuffer)
                         } catch (e: com.carlink.protocol.HeaderParseException) {
-                            log("Header parse error: ${e.message}")
+                            val hex = headerBuffer.take(16).joinToString(" ") { "%02X".format(it) }
+                            logWarn(
+                                "Header parse error: ${e.message} raw=[$hex]",
+                                tag = com.carlink.logging.Logger.Tags.PROTO_UNKNOWN,
+                            )
                             continue
                         }
 
                     // Reject corrupted headers with implausible payload sizes
                     if (header.length > MAX_PAYLOAD_SIZE) {
-                        log("Corrupted header: length=${header.length} exceeds max — skipping")
+                        val hex = headerBuffer.take(16).joinToString(" ") { "%02X".format(it) }
+                        logWarn(
+                            "Corrupted header: length=${header.length} exceeds max raw=[$hex]",
+                            tag = com.carlink.logging.Logger.Tags.PROTO_UNKNOWN,
+                        )
                         continue
                     }
 
@@ -573,6 +582,11 @@ class UsbDeviceWrapper(
                                 dataLength = totalRead
                                 payloadBuffer
                             } else {
+                                logWarn(
+                                    "[USB_PARTIAL] Incomplete payload for type=0x${header.type.id.toString(16)}: " +
+                                        "got=$totalRead/${header.length}B — dropped",
+                                    tag = com.carlink.logging.Logger.Tags.PROTO_UNKNOWN,
+                                )
                                 null
                             }
                         } else {
