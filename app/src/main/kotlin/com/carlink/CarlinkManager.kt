@@ -425,7 +425,9 @@ class CarlinkManager(
 
         logInfo(
             "[PLATFORM] Using AudioConfig: sampleRate=${audioConfig.sampleRate}Hz, " +
-                "bufferMult=${audioConfig.bufferMultiplier}x, prefill=${audioConfig.prefillThresholdMs}ms",
+                "bufferMult=${audioConfig.bufferMultiplier}x, prefill=${audioConfig.prefillThresholdMs}ms, " +
+                "minBufLevel=${audioConfig.minBufferLevelMs}ms, " +
+                "media=${audioConfig.mediaBufferCapacityMs}ms, nav=${audioConfig.navBufferCapacityMs}ms",
             tag = Logger.Tags.AUDIO,
         )
         logInfo(
