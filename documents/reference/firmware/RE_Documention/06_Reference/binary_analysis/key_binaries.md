@@ -14,11 +14,11 @@
 | ARMiPhoneIAP2 | 182KB | 494KB | iPhone IAP2 protocol handler |
 | ARMadb-driver | 217KB | 479KB | Main USB protocol handler |
 | ARMAndroidAuto | 489KB | 1,489KB | Android Auto protocol handler |
-| ARMHiCar | - | 132KB | Huawei HiCar support |
-| ARMandroid_Mirror | - | 106KB | Android mirroring |
+| ARMHiCar | - | 73KB | Huawei HiCar support |
+| ARMandroid_Mirror | - | 64KB | Android mirroring |
 | bluetoothDaemon | 173KB | 409KB | Bluetooth management |
 | mdnsd | - | 141KB | mDNS/Bonjour service (378KB runtime BSS) |
-| boxNetworkService | 45KB | - | Network management (not UPX packed) |
+| boxNetworkService | 45KB | - | Network management (custom LZMA packed, magic `0x55225522`) |
 | riddleBoxCfg | 30KB | 50KB | Configuration CLI |
 | server.cgi | - | 74KB | Web UI backend |
 | upload.cgi | - | 53KB | File upload handler |
@@ -52,7 +52,7 @@
 - Decompressor stub: 5,844 bytes at offset 0x76274
 - Stub uses direct Linux syscalls: `readlink("/proc/self/exe")` → `mmap2()` → LZMA decompress (lc=2, lp=0, pb=3) → `open("/dev/hwas", O_RDWR)` → `ioctl(fd, 0xC00C6206, ...)` → `mprotect()` → jump to decompressed code
 - **Successfully unpacked** (2026-02-28): UPX with header fix unpacked to 1,488,932 bytes. No section headers in output ELF.
-- **Key finding:** ARMAndroidAuto does NOT statically link the riddleBoxCfg config library — zero config system strings (no "BoxConfig", "riddle", "riddleConfig" etc.). It cannot read riddleBoxCfg keys directly.
+- **CORRECTED (2026-03-15):** Earlier claim that ARMAndroidAuto has "zero config system strings" was wrong. Full string verification found `GetBoxConfig`, `SetBoxConfig`, `ResetBoxConfig`, `riddleConfigNameValue`, `BoxConfig_DelayStart`, `BoxConfig_preferSPSPPSType`, `AndroidAutoWidth`, `AndroidAutoHeight` etc. ARMAndroidAuto **does** access the riddle config system. See `ARMAndroidAuto.md` for full analysis.
 - The same packer is used for `ARMadb-driver`, `ARMiPhoneIAP2`, and `AppleCarPlay` (but those also have UPX layer)
 
 #### ImprovedFluency Binary Trace (2026-02-28)

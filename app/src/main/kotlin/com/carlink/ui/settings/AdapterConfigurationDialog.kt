@@ -33,6 +33,7 @@ import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.PhoneInTalk
 import androidx.compose.material.icons.filled.Radio
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.SettingsInputComponent
 import androidx.compose.material.icons.filled.SignalCellularAlt
@@ -71,6 +72,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.carlink.CarlinkManager
+import com.carlink.logging.logInfo
 import com.carlink.logging.logWarn
 import com.carlink.ui.theme.AutomotiveDimens
 import kotlinx.coroutines.CoroutineScope
@@ -94,6 +96,7 @@ fun AdapterConfigurationDialog(
     carlinkManager: CarlinkManager?,
     currentDisplayMode: DisplayMode,
     onDismiss: () -> Unit,
+    onReinitAdapter: () -> Unit = {},
 ) {
     val colorScheme = MaterialTheme.colorScheme
     val scope = rememberCoroutineScope()
@@ -498,7 +501,7 @@ fun AdapterConfigurationDialog(
                             // Video Resolution Configuration
                             ConfigurationOptionCard(
                                 title = "Video Resolution",
-                                description = "Select resolution for CarPlay/Android Auto projection",
+                                description = "Select resolution for CarPlay. Android Auto not supported.",
                                 icon = Icons.Default.AspectRatio,
                             ) {
                                 // Auto option button
@@ -618,7 +621,7 @@ fun AdapterConfigurationDialog(
                             // Hand Drive Mode Configuration
                             ConfigurationOptionCard(
                                 title = "Drive Side",
-                                description = "Sets which side the CarPlay dock appears on",
+                                description = "Sets which side the Projection dock appears on.",
                                 icon = Icons.Default.DirectionsCar,
                             ) {
                                 Row(
@@ -658,7 +661,7 @@ fun AdapterConfigurationDialog(
                             // GPS Forwarding Configuration
                             ConfigurationOptionCard(
                                 title = "GPS Forwarding",
-                                description = "Forward vehicle GPS to CarPlay Maps",
+                                description = "Forward vehicle GPS to CarPlay. Android Auto not supported.",
                                 icon = Icons.Default.LocationOn,
                             ) {
                                 Row(
@@ -696,7 +699,7 @@ fun AdapterConfigurationDialog(
                             // Cluster Navigation Configuration
                             ConfigurationOptionCard(
                                 title = "Cluster Navigation",
-                                description = "Show CarPlay turn-by-turn on instrument cluster",
+                                description = "Show Projection turn-by-turn on Instrument Cluster.",
                                 icon = Icons.Default.Map,
                             ) {
                                 Row(
@@ -711,7 +714,7 @@ fun AdapterConfigurationDialog(
                                         modifier = Modifier.weight(1f),
                                     )
                                     AudioSourceButton(
-                                        label = "On",
+                                        label = "Enabled",
                                         icon = Icons.Default.Map,
                                         isSelected = selectedClusterNavigation,
                                         onClick = { selectedClusterNavigation = true },
@@ -722,7 +725,7 @@ fun AdapterConfigurationDialog(
                                 Text(
                                     text =
                                         if (selectedClusterNavigation) {
-                                            "Enabled — CarPlay navigation shown on cluster (requires restart)"
+                                            "Enabled — Projection Navigation shown on Cluster (requires restart)"
                                         } else {
                                             "Disabled — other navigation apps keep the cluster"
                                         },
@@ -734,7 +737,7 @@ fun AdapterConfigurationDialog(
                             // WiFi Band Configuration
                             ConfigurationOptionCard(
                                 title = "WiFi Band",
-                                description = "Wireless band for CarPlay connection",
+                                description = "Wireless band Adapter should use.",
                                 icon = Icons.Default.Wifi,
                             ) {
                                 Row(
@@ -870,11 +873,18 @@ fun AdapterConfigurationDialog(
                         Text("Default")
                     }
 
-                    // Apply & Restart button - all adapter config changes require restart
+                    // Apply button — tiered restart strategy:
+                    // Misc settings (GPS, WiFi, Cluster Nav) → Tier 3: kill app + adapter reboot
+                    // Audio/Visual settings only → Tier 2: in-place reinit (no app kill)
+                    val miscChanged =
+                        selectedGpsForwarding != savedGpsForwarding ||
+                            selectedWifiBand != savedWifiBand ||
+                            selectedClusterNavigation != savedClusterNavigation
+
                     Button(
                         onClick = {
                             logWarn(
-                                "[UI_ACTION] Adapter Config: Apply & Restart clicked" +
+                                "[UI_ACTION] Adapter Config: Apply clicked" +
                                     " - audio=$selectedAudioSource" +
                                     ", mic=$selectedMicSource" +
                                     ", wifi=$selectedWifiBand" +
@@ -884,7 +894,8 @@ fun AdapterConfigurationDialog(
                                     ", fps=${selectedFps.fps}" +
                                     ", handDrive=$selectedHandDrive" +
                                     ", gpsForwarding=$selectedGpsForwarding" +
-                                    ", clusterNav=$selectedClusterNavigation",
+                                    ", clusterNav=$selectedClusterNavigation" +
+                                    ", tier=${if (miscChanged) "3-KILL" else "2-REINIT"}",
                                 tag = "UI",
                             )
                             scope.launch {
@@ -900,32 +911,56 @@ fun AdapterConfigurationDialog(
                                 adapterConfigPreference.setGpsForwarding(selectedGpsForwarding)
                                 adapterConfigPreference.setClusterNavigation(selectedClusterNavigation)
 
-                                // All adapter config changes require restart.
-                                // Schedule MainActivity launch before kill so the system
-                                // restarts into it instead of the CarApp task.
-                                carlinkManager?.stop(reboot = true)
-                                val launchIntent =
-                                    context.packageManager
-                                        .getLaunchIntentForPackage(context.packageName)
-                                        ?.addFlags(
-                                            android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
-                                                android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK,
-                                        )
-                                launchIntent?.let { context.startActivity(it) }
-                                kotlinx.coroutines.delay(500)
-                                android.os.Process.killProcess(android.os.Process.myPid())
+                                if (miscChanged) {
+                                    // Tier 3: Misc settings changed — firmware-level changes
+                                    // require adapter reboot and full app restart.
+                                    // GPS forwarding: riddleBoxCfg command injection + daemon restart
+                                    // WiFi band: firmware radio reconfiguration
+                                    // Cluster navigation: CarAppActivity shim lifecycle
+                                    logWarn(
+                                        "[ADAPTER_REINIT] Tier 3: Misc settings changed" +
+                                            " (gps=${selectedGpsForwarding != savedGpsForwarding}" +
+                                            ", wifi=${selectedWifiBand != savedWifiBand}" +
+                                            ", cluster=${selectedClusterNavigation != savedClusterNavigation})" +
+                                            " — killing app",
+                                        tag = "UI",
+                                    )
+                                    val needsReboot = selectedGpsForwarding != savedGpsForwarding
+                                    carlinkManager?.stop(reboot = needsReboot)
+                                    val launchIntent =
+                                        context.packageManager
+                                            .getLaunchIntentForPackage(context.packageName)
+                                            ?.addFlags(
+                                                android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                                                    android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK,
+                                            )
+                                    launchIntent?.let { context.startActivity(it) }
+                                    kotlinx.coroutines.delay(500)
+                                    android.os.Process.killProcess(android.os.Process.myPid())
+                                } else {
+                                    // Tier 2: Audio/Visual settings only — in-place reinit.
+                                    // Tear down adapter session, rebuild CarlinkManager with
+                                    // new AdapterConfig, reconnect with MINIMAL_PLUS_CHANGES.
+                                    logInfo(
+                                        "[ADAPTER_REINIT] Tier 2: Audio/Visual settings only" +
+                                            " — reinitializing in-place (no app kill)",
+                                        tag = "UI",
+                                    )
+                                    onDismiss()
+                                    onReinitAdapter()
+                                }
                             }
                         },
                         modifier = Modifier.weight(1.5f),
                         enabled = hasChanges,
                     ) {
                         Icon(
-                            imageVector = Icons.Default.RestartAlt,
+                            imageVector = if (miscChanged) Icons.Default.RestartAlt else Icons.Default.Refresh,
                             contentDescription = null,
                             modifier = Modifier.size(18.dp),
                         )
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("Apply & Restart")
+                        Text(if (miscChanged) "Apply & Restart" else "Apply")
                     }
                 }
             }

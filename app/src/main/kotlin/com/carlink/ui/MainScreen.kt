@@ -75,24 +75,27 @@ fun MainScreen(
     onNavigateToSettings: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
-    var state by remember { mutableStateOf(CarlinkManager.State.DISCONNECTED) }
-    var statusText by remember { mutableStateOf("Connect Adapter") }
-    var isResetting by remember { mutableStateOf(false) }
+    // Key state on carlinkManager identity — when manager is replaced (display mode reinit),
+    // all session-scoped state resets automatically. This prevents stale callbacks, flags,
+    // or touch state from the old manager leaking into the new session.
+    var state by remember(carlinkManager) { mutableStateOf(CarlinkManager.State.DISCONNECTED) }
+    var statusText by remember(carlinkManager) { mutableStateOf("Connect Adapter") }
+    var isResetting by remember(carlinkManager) { mutableStateOf(false) }
     val surfaceState = rememberVideoSurfaceState()
-    var isAndroidAuto by remember { mutableStateOf(false) }
-    var aaCropParams by remember { mutableStateOf<CarlinkManager.AaCropParams?>(null) }
+    var isAndroidAuto by remember(carlinkManager) { mutableStateOf(false) }
+    var aaCropParams by remember(carlinkManager) { mutableStateOf<CarlinkManager.AaCropParams?>(null) }
 
     LaunchedEffect(state) {
         logInfo("[UI_STATE] MainScreen connection state: $state", tag = "UI")
     }
 
-    var lastTouchTime by remember { mutableLongStateOf(0L) }
-    val activeTouches = remember { mutableStateMapOf<Int, TouchPoint>() }
-    var hasStartedConnection by remember { mutableStateOf(false) }
+    var lastTouchTime by remember(carlinkManager) { mutableLongStateOf(0L) }
+    val activeTouches = remember(carlinkManager) { mutableStateMapOf<Int, TouchPoint>() }
+    var hasStartedConnection by remember(carlinkManager) { mutableStateOf(false) }
 
     // Container dimensions (display-mode-padded area) — used for BoxSettings AR calculation.
     // Tracked separately from surfaceState because AA oversizes the SurfaceView beyond the container.
-    var containerSize by remember { mutableStateOf(IntSize.Zero) }
+    var containerSize by remember(carlinkManager) { mutableStateOf(IntSize.Zero) }
 
     // Handle surface initialization for adapter — uses CONTAINER dimensions for config/BoxSettings,
     // not the SurfaceView dimensions (which may be oversized for AA bar cropping).

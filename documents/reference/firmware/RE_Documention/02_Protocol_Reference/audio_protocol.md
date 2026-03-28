@@ -31,7 +31,7 @@ The CarPlay audio protocol uses message type `0x07` (AudioData) with two key ide
 ├─────────┴──────┴────────────┴───────────────────────────────────────┤
 │                    AUDIO HEADER (12 bytes)                          │
 ├─────────┬──────┬────────────┬───────────────────────────────────────┤
-│ 0x10    │  4   │ decode_type│ Audio format (2, 4, or 5)             │
+│ 0x10    │  4   │ decode_type│ Audio format (2, 3, 4, or 5)           │
 │ 0x14    │  4   │ volume     │ Float volume multiplier (0.0-1.0)     │
 │ 0x18    │  4   │ audio_type │ Stream type (1=main, 2=nav, 3=mic)    │
 ├─────────┴──────┴────────────┴───────────────────────────────────────┤
@@ -50,15 +50,17 @@ PayloadLen = 12 (audio header) + audio_payload_size
 
 | Value | Name | Sample Rate | Channels | Purpose |
 |-------|------|-------------|----------|---------|
-| **2** | ALT_MEDIA | 44.1kHz | Stereo | **Dual-purpose:** Commands OR 44.1kHz audio data |
-| **4** | PLAYBACK | 48kHz | Stereo | Standard CarPlay HD audio |
+| **2** | ALT_MEDIA | 44.1kHz | Stereo | **Dual-purpose:** Commands OR 44.1kHz audio data (non-default; only when `mediaSound=0`) |
+| **4** | PLAYBACK | 48kHz | Stereo | Standard media audio (default for both CarPlay and Android Auto) |
 | **5** | VOICE | 16kHz | Mono | Voice mode (Siri, phone calls) |
 
-**Important:** Values 1, 3, 6, 7 were speculative in older docs and **NEVER observed** in USB captures.
+**Important:** The adapter is transparent — it passes through whatever sample rate the phone negotiates. CarPlay and Android Auto both default to 48kHz (decodeType=4) for media. decodeType=2 with 44.1kHz audio only appears when explicitly configured via `mediaSound=0` in BoxSettings. Values 1, 6, 7 are firmware-supported but not observed in USB captures. Value 3 (8kHz) is actively used for Android Auto phone calls (HFP/SCO narrowband, verified Mar 2026).
 
-### decode_type=3 (8kHz Narrowband) - VERIFIED UNOBSERVABLE (Jan 2026)
+### decode_type=3 (8kHz Narrowband) - Active for Android Auto Phone Calls
 
-**Binary analysis confirms** the firmware supports decodeType=3 → 8000 Hz mono at WebRTC AECM (0x2dfa2). However, extensive testing (CallQuality 0/1/2, multiple phone calls) **never triggered 8kHz audio**.
+**Update (Mar 2026):** decode_type=3 IS used for Android Auto phone calls. The Jan 2026 analysis was CarPlay-only. See `../03_Audio_Processing/microphone_processing.md` § AA Phone Call Microphone — FIXED.
+
+**Binary analysis confirms** the firmware supports decodeType=3 → 8000 Hz mono at WebRTC AECM (0x2dfa2). During Android Auto phone calls (HFP/SCO), the adapter sends `INPUT_CONFIG` with decodeType=3, requiring the host to capture and send mic audio at 8kHz. CarPlay phone calls continue to use decodeType=5 (16kHz) exclusively.
 
 **Why 8kHz is not observed:**
 
@@ -94,7 +96,7 @@ PayloadLen = 12 (audio header) + audio_payload_size
 | PayloadLen | Behavior | Example |
 |------------|----------|---------|
 | **13 bytes** | Command packet (STOP/cleanup signal) | MEDIA_STOP, PHONECALL_STOP |
-| **11532 bytes** | 44.1kHz stereo PCM audio data | Media from 44.1kHz source |
+| **11532 bytes** | 44.1kHz stereo PCM audio data | Media when `mediaSound=0` (non-default) |
 
 **Capture Evidence (44.1Khz_playback session 2025-12-29):**
 ```
@@ -112,8 +114,8 @@ USB packet:  decode_type=0x04, payload=11532 bytes → 48kHz audio
 
 | decode_type | Semantic Purpose | Commands Using This Type |
 |-------------|------------------|--------------------------|
-| 2 | **44.1kHz Audio / Stop Commands** | MEDIA_STOP, PHONECALL_STOP, 44.1kHz media |
-| 4 | **48kHz CarPlay Audio** | MEDIA_START, NAVI_START, OUTPUT_*, 48kHz media |
+| 2 | **Stop Commands / 44.1kHz Audio (non-default)** | MEDIA_STOP, PHONECALL_STOP, 44.1kHz media (only when `mediaSound=0`) |
+| 4 | **Default Media Audio (48kHz)** | MEDIA_START, NAVI_START, OUTPUT_*, 48kHz media (default for CarPlay and AA) |
 | 5 | **Voice/Mic Related** | SIRI_START, PHONECALL_START, INPUT_* |
 
 ---
@@ -333,17 +335,17 @@ VOL packet (vol=1.0)             ← Restore media
 
 | Stream | decode_type | audio_type | Start Cmd | Stop Cmd | Sample Rate |
 |--------|-------------|------------|-----------|----------|-------------|
-| Media (HD) | 4 | 1 | 0x0A | 0x0B | 48kHz |
-| Media (Alt) | 2 | 1 | 0x0A | 0x0B | 44.1kHz |
-| Navigation | 2/4 | 2 | 0x07 | 0x10 | 44.1/48kHz |
-| Notification | 2 | 2 | 0x07 | 0x10 | 44.1kHz |
+| Media (default) | 4 | 1 | 0x0A | 0x0B | 48kHz |
+| Media (alt, `mediaSound=0`) | 2 | 1 | 0x0A | 0x0B | 44.1kHz (non-default) |
+| Navigation | 4 (default) / 2 | 2 | 0x07 | 0x10 | 48kHz (default) / 44.1kHz |
+| Notification | 4 (default) / 2 | 2 | 0x07 | 0x10 | 48kHz (default) / 44.1kHz |
 | Siri (speaker) | 5 | 1 | 0x08 | - | 16kHz |
 | Siri (mic) | 5 | 3 | 0x03 | - | 16kHz |
 | Phone (speaker) | 5 | 1 | 0x05 | - | 16kHz |
-| Phone (mic) | 5 | 3 | 0x03 | - | 16kHz (8kHz in firmware code but vestigial — never observed) |
-| Ringtone | 2/4 | 1 | 0x0C | 0x0D | 44.1/48kHz |
+| Phone (mic) | 5 (CarPlay) / 3 (AA) | 3 | 0x03 | - | 16kHz for CarPlay, 8kHz for Android Auto phone calls (HFP/SCO) |
+| Ringtone | 4 (default) / 2 | 1 | 0x0C | 0x0D | 48kHz (default) / 44.1kHz |
 
-**Microphone Note:** Microphone audio (audio_type=3) must be 16kHz in practice. The firmware WebRTC AECM at `0x2dfa2` accepts only 8kHz or 16kHz and rejects other rates, but 8kHz is vestigial dead code — never observed in 22+ capture sessions. The `CallQuality→VoiceQuality` firmware bug and modern iPhone wideband negotiation ensure only 16kHz is ever used. See `../03_Audio_Processing/audio_formats.md` for full binary analysis.
+**Microphone Note:** Microphone audio (audio_type=3) must be 8kHz or 16kHz. The firmware WebRTC AECM at `0x2dfa2` accepts only these two rates. CarPlay uses 16kHz exclusively (iPhone wideband negotiation). Android Auto phone calls use 8kHz (HFP/SCO narrowband) — the adapter sends `INPUT_CONFIG` with decodeType=3 to signal 8kHz. Host apps must parse `decodeType` from the adapter's AudioData command and set mic capture rate accordingly. See `../03_Audio_Processing/microphone_processing.md` § AA Phone Call Microphone for the full fix.
 
 ---
 
@@ -651,8 +653,8 @@ The app pre-creates 8 AudioTrack instances covering all decode_type × stream_ty
 
 | # | decode_type | stream | Rate | Channels | Purpose |
 |---|-------------|--------|------|----------|---------|
-| 1 | 2 | Main | 44.1kHz | Stereo | CarPlay media |
-| 2 | 2 | Nav | 44.1kHz | Stereo | CarPlay navigation |
+| 1 | 4 | Main | 48kHz | Stereo | CarPlay media (default) |
+| 2 | 4 | Nav | 48kHz | Stereo | CarPlay navigation (default) |
 | 3 | 3 | Main | 8kHz | Mono | Narrowband phone call |
 | 4 | 4 | Main | 48kHz | Stereo | AA/HiCar media |
 | 5 | 5/7 | Main | 16kHz | Mono/Stereo | Wideband voice (Siri, calls) |

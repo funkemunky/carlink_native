@@ -15,7 +15,7 @@ android {
         applicationId = "cc.funkemunky.carlink"
         minSdk = 32
         targetSdk = 36
-        versionCode = 88
+        versionCode = 102
         versionName = "1.0.0"
 
 //###############################################
@@ -62,6 +62,7 @@ android {
         // See documents/revisions.txt [19], [21] for history.
         disable += "DiscouragedApi"
         disable += "Instantiatable"  // CarAppActivity from app-automotive AAR — false positive
+        disable += "InvalidUsesTagAttribute"  // "navigation" is valid for Car App Library nav apps
     }
 }
 

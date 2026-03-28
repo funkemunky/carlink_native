@@ -82,8 +82,16 @@ class CarlinkMediaBrowserService : MediaBrowserServiceCompat() {
         fun updateSessionToken(token: MediaSessionCompat.Token) {
             mediaSessionToken = token
             instance?.let { service ->
-                service.setSessionToken(token)
-                if (BuildConfig.DEBUG) Log.d(TAG, "[BROWSER_SERVICE] Session token pushed to running service")
+                // Guard: MediaBrowserServiceCompat.setSessionToken() throws
+                // IllegalStateException if called twice on the same service instance.
+                // This happens during in-place display mode reinit where CarlinkManager
+                // is recreated but the Service singleton persists.
+                try {
+                    service.setSessionToken(token)
+                    if (BuildConfig.DEBUG) Log.d(TAG, "[BROWSER_SERVICE] Session token pushed to running service")
+                } catch (e: IllegalStateException) {
+                    if (BuildConfig.DEBUG) Log.w(TAG, "[BROWSER_SERVICE] Session token already set (reinit), ignoring: ${e.message}")
+                }
             }
         }
 
@@ -179,8 +187,12 @@ class CarlinkMediaBrowserService : MediaBrowserServiceCompat() {
         // Update session token if available (may have been set after onCreate)
         if (sessionToken == null) {
             mediaSessionToken?.let { token ->
-                setSessionToken(token)
-                if (BuildConfig.DEBUG) Log.d(TAG, "[BROWSER_SERVICE] Session token set in onGetRoot")
+                try {
+                    setSessionToken(token)
+                    if (BuildConfig.DEBUG) Log.d(TAG, "[BROWSER_SERVICE] Session token set in onGetRoot")
+                } catch (e: IllegalStateException) {
+                    if (BuildConfig.DEBUG) Log.w(TAG, "[BROWSER_SERVICE] Session token already set in onGetRoot (reinit), ignoring: ${e.message}")
+                }
             }
         }
 

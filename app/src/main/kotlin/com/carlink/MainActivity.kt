@@ -79,6 +79,14 @@ class MainActivity : ComponentActivity() {
     private var fileLogManager: FileLogManager? = null
     private var currentDisplayMode: DisplayMode = DisplayMode.SYSTEM_UI_VISIBLE
 
+    // Observable state for Compose — replacement triggers recomposition of CarlinkApp
+    private val carlinkManagerState = mutableStateOf<CarlinkManager?>(null)
+    private val displayModeState = mutableStateOf(DisplayMode.SYSTEM_UI_VISIBLE)
+
+    // Pending reinit handler — tracked for cancellation on rapid display mode changes
+    private var pendingReinitRunnable: Runnable? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     // Permission launchers — chained: mic callback triggers location request
     private val locationPermissionLauncher =
         registerForActivityResult(
@@ -179,18 +187,22 @@ class MainActivity : ComponentActivity() {
         }
 
         // Set up Compose UI
-        // carlinkManager is guaranteed non-null here since initializeCarlinkManager()
-        // completed synchronously above. Use !! with confidence.
-        val manager = carlinkManager!!
+        // CarlinkManager is observed via mutableStateOf — replacement during display mode
+        // reinit triggers full recomposition without Activity restart.
         setContent {
+            val manager = carlinkManagerState.value
+            val displayMode = displayModeState.value
             CarlinkTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    CarlinkApp(
-                        carlinkManager = manager,
-                        fileLogManager = fileLogManager,
-                        displayMode = currentDisplayMode,
-                        onResetCluster = ::restartClusterBinding,
-                    )
+                    if (manager != null) {
+                        CarlinkApp(
+                            carlinkManager = manager,
+                            fileLogManager = fileLogManager,
+                            displayMode = displayMode,
+                            onResetCluster = ::restartClusterBinding,
+                            onReinitForDisplayMode = ::reinitializeForDisplayMode,
+                        )
+                    }
                 }
             }
         }
@@ -301,20 +313,6 @@ class MainActivity : ComponentActivity() {
         logInfo("[LOGGING] Debug logging: ${if (isDebugBuild) "ENABLED" else "DISABLED (release build)"}", tag = "MAIN")
     }
 
-    // TODO [CODEC_INIT_TIMING]: Test deferring codec initialization until AFTER USB permission granted.
-    //
-    // PROBLEM: GM AAOS USB permission popup causes surface destruction + recreation cycle.
-    // Current sequence: codec init → permission popup → surface destroyed → codec reset (wasted work)
-    // Proposed sequence: permission popup → granted → THEN codec init (single init at final size)
-    //
-    // CAVEAT: Mid-session USB reset would still trigger permission popup (GM AAOS doesn't
-    // remember USB permissions by design). In that case, the codec is already running and
-    // the current pause/resume lifecycle handling would still apply. This optimization
-    // only benefits initial app launch, not reconnection scenarios.
-    //
-    // Test: Move carlinkManager.initializeVideo() call to after USB permission callback.
-    // Ensure touch normalization and adapter config still receive correct dimensions.
-
     private fun initializeCarlinkManager() {
         // Get window metrics to determine USABLE area (excluding system UI)
         // Using WindowMetrics API (minSdk 32 guarantees API 30+ availability)
@@ -386,10 +384,9 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Get DPI and refresh rate from display metrics
+        // Get DPI from display metrics
         val displayMetrics = resources.displayMetrics
         val dpi = displayMetrics.densityDpi
-        val refreshRate = display?.refreshRate?.toInt() ?: 60
 
         // Round to even numbers for H.264 compatibility
         val evenWidth = videoWidth and 1.inv()
@@ -470,8 +467,6 @@ class MainActivity : ComponentActivity() {
                 viewAreaData = viewAreaData,
                 safeAreaData = safeAreaData,
                 gpsForwarding = userConfig.gpsForwarding,
-                nativeDisplayWidth = bounds.width(),
-                nativeDisplayHeight = bounds.height(),
             )
 
         logInfo(
@@ -500,6 +495,86 @@ class MainActivity : ComponentActivity() {
         )
 
         carlinkManager = CarlinkManager(this, config)
+        carlinkManagerState.value = carlinkManager
+        displayModeState.value = currentDisplayMode
+    }
+
+    /**
+     * Reinitialize the adapter session for a new display mode WITHOUT killing the app.
+     *
+     * Replaces the old Process.killProcess() approach. Performs a Tier-2 session restart:
+     * 1. Save new display mode preference
+     * 2. Stop adapter session (graceful teardown)
+     * 3. Release old CarlinkManager
+     * 4. Apply new system bar visibility
+     * 5. Recalculate resolution from fresh WindowMetrics
+     * 6. Create new CarlinkManager with new AdapterConfig
+     * 7. Compose recomposes via carlinkManagerState → new surface → initialize() → start()
+     *
+     * The adapter sees a clean disconnect + reconnect with correct new resolution.
+     * End state is identical to kill+relaunch.
+     */
+    fun reinitializeForDisplayMode(newMode: DisplayMode) {
+        // Cancel any pending reinit from a previous rapid display mode change
+        pendingReinitRunnable?.let { mainHandler.removeCallbacks(it) }
+        pendingReinitRunnable = null
+
+        val displayModeChanged = newMode != currentDisplayMode
+        logInfo(
+            "[DISPLAY_REINIT] Begin — switching from ${currentDisplayMode.name} to ${newMode.name}" +
+                " (displayModeChanged=$displayModeChanged)",
+            tag = "MAIN",
+        )
+
+        // When display mode changes, reset video resolution to Auto.
+        // The old custom resolution was calculated for the old display bounds —
+        // keeping it would cause stretch/shrink with the new bounds.
+        // Write sync cache directly (not DataStore) to guarantee getUserConfigSync()
+        // reads the updated value when initializeCarlinkManager() runs after 200ms.
+        if (displayModeChanged) {
+            val adapterConfigPref = AdapterConfigPreference.getInstance(this)
+            val currentRes = adapterConfigPref.getUserConfigSync().videoResolution
+            if (!currentRes.isAuto) {
+                logInfo(
+                    "[DISPLAY_REINIT] Resetting video resolution from ${currentRes.toStorageString()} to AUTO" +
+                        " (display mode changed, old resolution invalid for new bounds)",
+                    tag = "MAIN",
+                )
+                // Sync cache write is immediate — guarantees initializeCarlinkManager reads AUTO
+                adapterConfigPref.setVideoResolutionSync(
+                    com.carlink.ui.settings.VideoResolutionConfig.AUTO,
+                )
+            }
+        }
+
+        // 1. Tear down current adapter session
+        val oldManager = carlinkManager
+        if (oldManager != null) {
+            logInfo("[DISPLAY_REINIT] Stopping current adapter session", tag = "MAIN")
+            // Clear Compose reference FIRST — stops surface callbacks into old manager
+            carlinkManagerState.value = null
+            oldManager.release()
+            carlinkManager = null
+            logInfo("[DISPLAY_REINIT] Old CarlinkManager released", tag = "MAIN")
+        }
+
+        // 2. Apply new display mode (shows/hides system bars)
+        currentDisplayMode = newMode
+        applyDisplayMode(newMode)
+        logInfo("[DISPLAY_REINIT] Applied display mode: ${newMode.name}", tag = "MAIN")
+
+        // 3. Allow a frame for WindowMetrics to stabilize after bar visibility change,
+        //    then rebuild CarlinkManager with fresh resolution.
+        val reinitRunnable = Runnable {
+            if (!isDestroyed && !isFinishing) {
+                logInfo("[DISPLAY_REINIT] Rebuilding CarlinkManager with new metrics", tag = "MAIN")
+                initializeCarlinkManager()
+                logInfo("[DISPLAY_REINIT] Complete — CarlinkManager recreated", tag = "MAIN")
+            }
+            pendingReinitRunnable = null
+        }
+        pendingReinitRunnable = reinitRunnable
+        mainHandler.postDelayed(reinitRunnable, 200)
     }
 
     /** Build HU_VIEWAREA_INFO (24 bytes): [screen_w, screen_h, view_w, view_h, originX, originY] */
@@ -584,6 +659,7 @@ class MainActivity : ComponentActivity() {
         // Read preference from sync cache (instant, no I/O blocking)
         // This ensures the viewport is correctly sized before the first build
         currentDisplayMode = DisplayModePreference.getInstance(this).getDisplayModeSync()
+        displayModeState.value = currentDisplayMode
 
         applyDisplayMode(currentDisplayMode)
         logInfo("[DISPLAY_MODE] Applied mode: ${currentDisplayMode.name}", tag = "MAIN")
@@ -752,6 +828,7 @@ fun CarlinkApp(
     fileLogManager: FileLogManager?,
     displayMode: DisplayMode,
     onResetCluster: () -> Unit,
+    onReinitForDisplayMode: (DisplayMode) -> Unit = {},
 ) {
     var showSettings by remember { mutableStateOf(false) }
 
@@ -800,6 +877,7 @@ fun CarlinkApp(
                     showSettings = false
                 },
                 onResetCluster = onResetCluster,
+                onReinitForDisplayMode = onReinitForDisplayMode,
             )
         }
     }

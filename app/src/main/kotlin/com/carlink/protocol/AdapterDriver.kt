@@ -44,7 +44,6 @@ class AdapterDriver(
     private val receiveErrors = AtomicInteger(0)
     private val heartbeatsSent = AtomicInteger(0)
     private val sessionStart = AtomicLong(0)
-    private val lastHeartbeat = AtomicLong(0)
     private var initMessagesCount = 0
 
     /**
@@ -60,10 +59,10 @@ class AdapterDriver(
         pendingChanges: Set<String> = emptySet(),
         surfaceWidth: Int = 0,
         surfaceHeight: Int = 0,
-    ) {
+    ): Boolean {
         if (isRunning.getAndSet(true)) {
             log("Adapter already running")
-            return
+            return true
         }
 
         sessionStart.set(System.currentTimeMillis())
@@ -73,7 +72,7 @@ class AdapterDriver(
             log("USB device not opened")
             errorHandler("USB device not opened")
             isRunning.set(false)
-            return
+            return false
         }
 
         // Start heartbeat FIRST for firmware stabilization
@@ -83,18 +82,21 @@ class AdapterDriver(
         // Send initialization sequence based on mode
         val initMessages = MessageSerializer.generateInitSequence(config, initMode, pendingChanges, surfaceWidth, surfaceHeight)
         initMessagesCount = initMessages.size
+        var initFailures = 0
         log("Sending $initMessagesCount initialization messages (mode=$initMode, changes=$pendingChanges)")
 
         for ((index, message) in initMessages.withIndex()) {
             log("Init message ${index + 1}/$initMessagesCount")
             if (!send(message)) {
+                initFailures++
                 log("Failed to send init message ${index + 1}")
             }
             // Delay between messages to allow adapter firmware to process each one
             Thread.sleep(120)
         }
 
-        log("Initialization sequence completed")
+        val allSent = initFailures == 0
+        log("Initialization sequence completed (${initMessagesCount - initFailures}/$initMessagesCount sent)")
 
         // Schedule wifiConnect with timeout (matches pi-carplay behavior)
         wifiConnectTimer =
@@ -115,6 +117,8 @@ class AdapterDriver(
         // Start reading loop
         log("Starting message reading loop")
         startReadingLoop()
+
+        return allSent
     }
 
     /**
@@ -213,11 +217,6 @@ class AdapterDriver(
         return send(MessageSerializer.serializeRebootAdapter())
     }
 
-    fun resetUsb(): Boolean {
-        log("[SEND] USB reset (0xCE)")
-        return send(MessageSerializer.serializeUsbReset())
-    }
-
     fun disconnectPhone(): Boolean {
         log("[SEND] Disconnect phone (0x0F)")
         return send(MessageSerializer.serializeDisconnectPhone())
@@ -226,6 +225,45 @@ class AdapterDriver(
     fun closeDongle(): Boolean {
         log("[SEND] Close dongle (0x15)")
         return send(MessageSerializer.serializeCloseDongle())
+    }
+
+    /**
+     * Request the adapter to connect to a specific paired device by BT MAC address.
+     * Uses type 0x11 (AutoConnect_By_BluetoothAddress) H→A direction.
+     */
+    fun sendAutoConnectByBtAddress(btMac: String): Boolean {
+        log("[SEND] AutoConnect_By_BluetoothAddress: $btMac")
+        return send(MessageSerializer.serializeAutoConnectByBtAddress(btMac))
+    }
+
+    /**
+     * Request the adapter to forget/remove a device from its paired list.
+     * Moves the device from DevList to DeletedDevList, preventing auto-reconnect.
+     */
+    fun sendForgetBluetoothAddr(btMac: String): Boolean {
+        log("[SEND] ForgetBluetoothAddr: $btMac")
+        return send(MessageSerializer.serializeForgetBluetoothAddr(btMac))
+    }
+
+    /**
+     * Cancel the pending wifiConnect auto-connect timer and send a targeted
+     * AutoConnect_By_BluetoothAddress instead. Called when the user explicitly
+     * selects a device to connect to during a restart cycle.
+     */
+    fun overrideAutoConnectWithTarget(btMac: String): Boolean {
+        wifiConnectTimer?.cancel()
+        wifiConnectTimer = null
+        log("[SEND] Overriding auto-connect with targeted connect: $btMac")
+        return sendAutoConnectByBtAddress(btMac)
+    }
+
+    /**
+     * Request the adapter to send its current list of paired BT devices.
+     * Adapter responds with updated BoxSettings (0x19) containing DevList.
+     */
+    fun sendGetBtOnlineList(): Boolean {
+        log("[SEND] GetBluetoothOnlineList")
+        return sendCommand(CommandMapping.GET_BT_ONLINE_LIST)
     }
 
     /**
@@ -260,7 +298,6 @@ class AdapterDriver(
                             // which would stop all heartbeats and cause adapter disconnect.
                             try {
                                 if (isRunning.get()) {
-                                    lastHeartbeat.set(System.currentTimeMillis())
                                     heartbeatsSent.incrementAndGet()
                                     if (!send(MessageSerializer.serializeHeartbeat())) {
                                         log("Heartbeat send failed (count: $heartbeatsSent)")
@@ -305,7 +342,8 @@ class AdapterDriver(
                             messageHandler(VideoStreamingSignal)
                         } catch (e: Exception) {
                             receiveErrors.incrementAndGet()
-                            log("Message handler error: ${e.message}")
+                            val trace = e.stackTraceToString().take(500)
+                            log("VideoStreamingSignal handler error: ${e.message}\n$trace")
                         }
                         return
                     }
@@ -324,7 +362,8 @@ class AdapterDriver(
                         messageHandler(message)
                     } catch (e: Exception) {
                         receiveErrors.incrementAndGet()
-                        log("Message handler error: ${e.message}")
+                        val trace = e.stackTraceToString().take(500)
+                        log("Message handler error for $message: ${e.message}\n$trace")
                     }
                 }
 
@@ -377,7 +416,6 @@ class AdapterDriver(
         receiveErrors.set(0)
         heartbeatsSent.set(0)
         sessionStart.set(0)
-        lastHeartbeat.set(0)
         initMessagesCount = 0
     }
 

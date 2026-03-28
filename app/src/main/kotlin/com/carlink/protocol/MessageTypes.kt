@@ -158,8 +158,8 @@ enum class CommandMapping(
     // === Android Auto Focus Commands (500-507) ===
     REQUEST_VIDEO_FOCUS(500), // RequestVideoFocus (A→H) - Adapter requests host show video
     RELEASE_VIDEO_FOCUS(501), // ReleaseVideoFocus (A→H) - Adapter releases video focus
-    AA_UNKNOWN_502(502), // Android Auto related (unverified)
-    AA_UNKNOWN_503(503), // Android Auto related (unverified)
+    REQUEST_AUDIO_FOCUS(502), // RequestAudioFocus (A→H) - AA audio started (binary-verified Feb 2026)
+    REQUEST_AUDIO_FOCUS_TRANSIENT(503), // RequestAudioFocusTransient (A→H) - Transient audio focus (binary-verified Feb 2026)
     REQUEST_AUDIO_FOCUS_DUCK(504), // RequestAudioFocusDuck (A→H) - Request audio ducking
     RELEASE_AUDIO_FOCUS(505), // ReleaseAudioFocus (A→H) - Release audio focus
     REQUEST_NAVI_FOCUS(506), // RequestNaviFocus (A→H) - Request navigation audio focus
@@ -245,6 +245,7 @@ enum class MessageType(
     HI_CAR_LINK(0x18),
     PEER_BLUETOOTH_ADDRESS(0x23), // Binary: Bluetooth_ConnectStart — BT connection started, carries peer MAC
     PEER_BLUETOOTH_ADDRESS_ALT(0x24), // Binary: Bluetooth_Connected — BT connected, carries peer MAC
+    FORGET_BLUETOOTH_ADDR(0x22), // BOTH: Remove/forget a BT address from adapter's paired list (MAC payload)
     UI_HIDE_PEER_INFO(0x25), // Binary: Bluetooth_DisConnect — BT disconnected / hide peer info
     UI_BRING_TO_FOREGROUND(0x26), // Binary: Bluetooth_Listen — BT listening/advertising / bring to foreground
 
@@ -264,7 +265,7 @@ enum class MessageType(
     // Additional Adapter→Host Messages (Firmware Binary Analysis)
     CARPLAY_CONTROL(0x0B), // CMD_ACK / CarPlay control acknowledgment
     DASHBOARD_DATA(0x10), // Dashboard/instrument cluster data (DashBoard_DATA)
-    WIFI_STATUS_DATA(0x11), // WiFi status information
+    WIFI_STATUS_DATA(0x11), // A→H: WiFi status info; H→A: AutoConnect_By_BluetoothAddress (MAC payload)
     DISK_INFO(0x13), // Adapter disk/storage information
     DEVICE_EXTENDED_INFO(0x1B), // Extended device information
     REMOTE_CX_CY(0x1E), // Display resolution broadcast from adapter
@@ -329,6 +330,40 @@ enum class AudioCommand(
 }
 
 /**
+ * Stream purpose for audio routing and AudioFocus management.
+ *
+ * Derived from AudioCommand packets (SIRI_START, PHONECALL_START, etc.)
+ * to create per-purpose AudioTracks with correct AudioAttributes/USAGE,
+ * enabling AAOS to route streams to the correct audio zones.
+ */
+enum class StreamPurpose {
+    MEDIA,       // Music, podcasts (default)
+    PHONE_CALL,  // Active phone call
+    SIRI,        // Voice assistant
+    ALERT,       // System alerts/notifications
+    RINGTONE,    // Incoming call ring
+    NAVIGATION,  // Turn-by-turn (has own track, included for completeness)
+    ;
+
+    companion object {
+        val DEFAULT = MEDIA
+    }
+}
+
+/**
+ * Audio routing state flags for two-factor PCM routing.
+ *
+ * Routes audio by combining active command state with format match,
+ * rather than a single mutable purpose. This prevents transition artifacts
+ * where media PCM briefly routes to the wrong AudioTrack.
+ */
+data class AudioRoutingState(
+    val isSiriActive: Boolean = false,
+    val isPhoneCallActive: Boolean = false,
+    val isAlertActive: Boolean = false,
+)
+
+/**
  * File addresses for adapter configuration files.
  */
 enum class FileAddress(
@@ -390,8 +425,10 @@ enum class MediaType(
     val id: Int,
 ) {
     DATA(1),
-    ALBUM_COVER(3),
+    ALBUM_COVER_AA(2), // Android Auto album art — PNG at offset +4 (subtype 2)
+    ALBUM_COVER(3),    // CarPlay album art — JPEG at offset +4 (subtype 3)
     NAVI_JSON(200),
+    NAVI_IMAGE(201),
     UNKNOWN(-1),
     ;
 
@@ -460,8 +497,6 @@ data class AdapterConfig(
     val iBoxVersion: Int = 2,
     val packetMax: Int = 49152,
     val phoneWorkMode: Int = 2,
-    /** Night mode: false=light theme, true=dark theme for CarPlay display */
-    val nightMode: Boolean = false,
     val boxName: String = "carlink",
     val mediaDelay: Int = 1000,
     /** Audio transfer mode: true=bluetooth, false=adapter (USB audio, default) */
@@ -478,10 +513,6 @@ data class AdapterConfig(
     val handDriveMode: Int = 0,
     /** GPS forwarding: true = forward vehicle GPS to CarPlay (GNSSCapability=3), false = disabled (GNSSCapability=0) */
     val gpsForwarding: Boolean = false,
-    /** Native display width in pixels — used only for AA margin math, not sent to adapter */
-    val nativeDisplayWidth: Int = 0,
-    /** Native display height in pixels — used only for AA margin math, not sent to adapter */
-    val nativeDisplayHeight: Int = 0,
     val icon120Data: ByteArray? = null,
     val icon180Data: ByteArray? = null,
     val icon256Data: ByteArray? = null,

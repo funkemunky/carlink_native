@@ -159,7 +159,7 @@ Verified from firmware switch statement at fcn.00017b74.
 - 429 navigation video packets analyzed
 - Resolution: 1200x500 (matches host's naviScreenInfo configuration)
 - NAL distribution: 4 SPS (I-frames), 425 P-frames
-- Unknown1 field: Always 1 (does NOT indicate frame type)
+- EncoderState field: Always 1 for nav video (does NOT indicate frame type)
 - Frame type determined by NAL unit type in H.264 payload
 
 **Requirements (Corrected Feb 2026):**
@@ -427,7 +427,7 @@ This cycle takes ~3ms, visible as a brief PTS gap around each keyframe.
 - Runs 3-6 correctly suppressed FRAME (0 commands sent)
 - **Natural IDR interval: 62-68s** (encoder `sync-frame-interval=60000000` μs)
 - No external keyframe control available — decoder must wait for next natural IDR
-- **Contrast with CarPlay**: 2s forced keyframe cycle via `Command FRAME` → AVE encoder restart
+- **Contrast with CarPlay**: Periodic forced keyframe cycle via `Command FRAME` → AVE encoder restart (2.5s initial, 30s periodic). The periodic interval is a mitigation for the GM Info 3.7 (Intel Atom x7-A3960) platform, where the Intel VPU can silently corrupt decoder state mid-session due to USB stalls, hypervisor interrupts, or VPU firmware bugs outside the app's control. CarPlay encoder teardown is invisible to the user at any reasonable interval. The 30s value can be adjusted per-platform — 2s was used historically with no user-visible impact, shorter intervals trade iPhone encoder overhead for faster corruption recovery
 
 ---
 
@@ -561,7 +561,7 @@ Run 6 captured an abnormally small first IDR of **1,206 bytes** (vs typical 9–
 
 **Impact**: All P-frames following a boot-screen IDR reference this low-quality frame, causing ~2 seconds of degraded output until the next ForceKeyFrame triggers a clean IDR at full resolution.
 
-**Mitigation**: `H264Renderer.flushOnNextIdr` — flush the codec on the second IDR to clear poisoned reference frames. This is decoder-side only; no adapter commands are involved.
+**Mitigation**: `AA_RENDER_SKIP_COUNT=4` — skip first 4 decoded frames in Android Auto mode, preventing boot-screen display entirely. The decoder warms up cleanly before rendering starts. This is decoder-side only; no adapter commands are involved. (Earlier `flushOnNextIdr` approach was removed as inferior.)
 
 ### Android Auto Boot-Screen IDR Poisoning (Mar 2026)
 
@@ -571,12 +571,12 @@ AA boot-screen IDR poisoning is **deterministic and severe** — far worse than 
 |--------|---------|-------------|
 | First IDR size | 1,206–90,549B (variable) | **2,735B (identical all 6 runs, all 10 sync events)** |
 | Bits/pixel | Variable | 0.024 bits/pixel — near-empty boot-screen |
-| Poisoning window | ~2s (next ForceKeyFrame clears) | **60-70s** (no forced keyframe mitigation) |
-| Natural IDR size | N/A (forced every 2s) | 49,792-58,654B (18-21× larger than boot-screen) |
+| Poisoning window | ~30s (next ForceKeyFrame clears, configurable) | **60-70s** (no forced keyframe mitigation) |
+| Natural IDR size | N/A (forced every 30s, configurable) | 49,792-58,654B (18-21× larger than boot-screen) |
 
 The 2,735B IDR encodes the AA startup animation — a nearly uniform dark background that compresses to <3KB for 921,600 pixels (1280×720). All subsequent P-frames reference this degenerate IDR until the next natural IDR at ~65 seconds.
 
-**`flushOnNextIdr` mechanism**: Flushes codec on the second IDR (the natural IDR at ~65s) to clear poisoned references. However, the flush **drops** that IDR — the next P-frames reference nothing, causing a brief glitch at the flush point. The watchdog then detects zombie codec (Rx:N Dec:0 for 2s) and triggers a reset + re-sync.
+**Current mitigation (`AA_RENDER_SKIP_COUNT=4`)**: Skips the first 4 decoded frames without rendering them (releases with `shouldRender=false`). This prevents the boot-screen from ever being displayed and allows the codec to warm up cleanly. Matches AutoKit's behavior. The earlier `flushOnNextIdr` approach (flush codec on second IDR) was removed because it dropped the IDR and caused a brief glitch requiring watchdog recovery.
 
 ---
 
@@ -817,9 +817,9 @@ Offset  Size  Field         Example
 ------  ----  -----         -------
 0x10    4     Width         1200 (0x04B0)
 0x14    4     Height        500 (0x01F4)
-0x18    4     TotalSize     Frame data size
-0x1C    4     FrameSize     H.264 NAL unit size
-0x20    4     Flags         EncoderState (see above)
+0x18    4     EncoderState  Encoder generation/stream ID (typically 1)
+0x1C    4     PTS           Presentation timestamp (1kHz clock)
+0x20    4     Flags         Usually 0x00000000
 ```
 Note: Offsets are relative to USB message start (16-byte USB header + 20-byte video header = 36 bytes total).
 
@@ -1144,6 +1144,8 @@ Rule: Deep buffering (seconds) is counterproductive for projection video.
       Drop frames rather than buffer for "smooth playback."
 ```
 
+> **Manufacturer reference (PhoneMirrorBox r5889):** When decode buffer backlog exceeds 2× framerate (e.g., >120 frames at 60fps), the reference app requests a keyframe via `CarPlay_RequestKeyFrame` (sub-cmd 12), then clears all buffered frames, then sets a flag to discard P-frames until the next IDR arrives. AutoKit (2025.03) uses a different strategy: blocking `dequeueInputBuffer` with a long timeout, plus output-side frame dropping based on presentation timing.
+
 ### GOP Structure
 
 | Metric | Value |
@@ -1211,6 +1213,38 @@ Given the host display dimensions (`srcWidth` × `srcHeight`), four tiers are ge
 | 1440p | 2560 | `(2560 * srcHeight / srcWidth) & 0xFFFE` | 1440 |
 
 Default tier selection: **720p** (index 1). User-configurable via preference `vandroidautoh` (480/720/1080/1440).
+
+### 1440p / 2160p: Not Supported by Android Auto (Verified 2026-03-12)
+
+**Device:** Pixel 10 (frankel), Android 16 (API 36), security patch 2026-02-05
+**AA Version:** v16.3.660834-release (com.google.android.projection.gearhead)
+
+Although the AutoKit manufacturer app defines 4 tiers (including 1440p) and the Android Auto APK contains enum values for `VIDEO_2560x1440`, `VIDEO_1440x2560`, `VIDEO_3840x2160`, and `VIDEO_2160x3840` (class `wvc`, ordinals 3/4/7/8), **the actual resolution mapping function (`gvu.p()`) throws `iuz("Unsupported resolution")` for any resolution above 1080p.**
+
+Verified by JADX decompilation of `base.apk` pulled from Pixel 10:
+
+```java
+// gvu.p() — the only function that maps wvc enum → Size for video negotiation
+static final Size p(wvc wvcVar) throws iuz {
+    int iOrdinal = wvcVar.ordinal();
+    if (iOrdinal == 0) return new Size(800, 480);    // VIDEO_800x480
+    if (iOrdinal == 1) return new Size(1280, 720);   // VIDEO_1280x720
+    if (iOrdinal == 2) return new Size(1920, 1080);  // VIDEO_1920x1080
+    if (iOrdinal == 5) return new Size(720, 1280);   // VIDEO_720x1280 (portrait)
+    if (iOrdinal == 6) return new Size(1080, 1920);  // VIDEO_1080x1920 (portrait)
+    throw new iuz("Unsupported resolution: " + wvcVar.name());
+}
+```
+
+This function is called by `gvu.n()` → `wcs.b()` during video size negotiation. Selecting "1440p" or "2160p" in AA Developer Settings (`car_video_resolution`) will cause a runtime exception.
+
+**Additional constraints from AA APK analysis:**
+- **Framerate:** 480p and 720p get **60fps**; 1080p gets **30fps** (determined by `vbu.aj()` — ordinals 0,1 → 60fps, else → 30fps)
+- **Codecs supported:** H.264 Baseline Profile, H.265, AV1 (class `idx`, field `h`)
+- **Wireless restriction:** Resolution may be further limited by Wi-Fi frequency band (5GHz required for wireless AA; log: `"VideoCodecResolutionType %s (%d) is not allowed due wireless frequency"`)
+- **Manufacturer blocklist:** Subaru and HARMAN head units have a separate resolution restriction path (class `idx`, field `b`)
+
+**Conclusion:** The effective maximum AA resolution is **1920×1080 @ 30fps** (landscape) or **1080×1920 @ 30fps** (portrait). The 1440p/2160p enum values and dev settings entries are forward-looking placeholders with no functional implementation as of AA v16.3.
 
 **Example for GM gminfo37 (2400×960):**
 - 720p tier: width = `(720 * 2400/960) & 0xFFFE` = `1800 & 0xFFFE` = **1800**, height = **720**

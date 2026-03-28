@@ -301,8 +301,6 @@ class MicrophoneCaptureManager(
         isRunning.get() &&
             audioRecord?.recordingState == AudioRecord.RECORDSTATE_RECORDING
 
-    fun availableBytes(): Int = micBuffer?.availableForRead() ?: 0
-
     fun bufferLevelMs(): Int = micBuffer?.fillLevelMs() ?: 0
 
     fun getStats(): Map<String, Any> {

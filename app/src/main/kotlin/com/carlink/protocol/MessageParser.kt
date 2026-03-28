@@ -1,6 +1,7 @@
 package com.carlink.protocol
 
 import com.carlink.audio.AudioFormats
+import com.carlink.logging.Logger
 import com.carlink.logging.logWarn
 import org.json.JSONException
 import org.json.JSONObject
@@ -88,7 +89,7 @@ object MessageParser {
 
             MessageType.BLUETOOTH_PIN -> parseStringPayload(header, payload, "BluetoothPin")
 
-            MessageType.BLUETOOTH_PAIRED_LIST -> parseStringPayload(header, payload, "BluetoothPairedList")
+            MessageType.BLUETOOTH_PAIRED_LIST -> parseBluetoothPairedList(header, payload)
 
             MessageType.MANUFACTURER_INFO -> parseStringPayload(header, payload, "ManufacturerInfo")
 
@@ -125,6 +126,8 @@ object MessageParser {
 
             MessageType.WIFI_STATUS_DATA -> parseHexPayload(header, payload, "WiFiStatusData")
 
+            MessageType.FORGET_BLUETOOTH_ADDR -> parseStringPayload(header, payload, "ForgetBluetoothAddr")
+
             MessageType.DISK_INFO -> parseStringPayload(header, payload, "DiskInfo")
 
             MessageType.DEVICE_EXTENDED_INFO -> parseHexPayload(header, payload, "DeviceExtendedInfo")
@@ -145,7 +148,7 @@ object MessageParser {
             // but if it arrives here (no videoProcessor), parse as info
             MessageType.NAVI_VIDEO_DATA -> InfoMessage(header, "NaviVideoData", "${header.length}B")
 
-            else -> UnknownMessage(header)
+            else -> UnknownMessage(header, payload)
         }
 
     private fun parseAudioData(
@@ -153,7 +156,7 @@ object MessageParser {
         payload: ByteArray?,
     ): Message {
         if (payload == null || header.length < 12) {
-            return UnknownMessage(header)
+            return UnknownMessage(header, payload)
         }
 
         val buffer = ByteBuffer.wrap(payload, 0, header.length).order(ByteOrder.LITTLE_ENDIAN)
@@ -175,6 +178,7 @@ object MessageParser {
                     command = AudioCommand.fromId(commandId),
                     data = null,
                     volumeDuration = null,
+                    rawCommandId = commandId,
                 )
             }
 
@@ -234,10 +238,21 @@ object MessageParser {
 
         val mediaPayload: Map<String, Any> =
             when (mediaType) {
-                MediaType.ALBUM_COVER -> {
+                MediaType.ALBUM_COVER,
+                MediaType.ALBUM_COVER_AA -> {
                     val imageData = ByteArray(header.length - 4)
                     System.arraycopy(payload, 4, imageData, 0, imageData.size)
                     mapOf("AlbumCover" to imageData)
+                }
+
+                MediaType.NAVI_IMAGE -> {
+                    if (header.length > 4) {
+                        val imageData = ByteArray(header.length - 4)
+                        System.arraycopy(payload, 4, imageData, 0, imageData.size)
+                        mapOf("NaviImage" to imageData)
+                    } else {
+                        emptyMap()
+                    }
                 }
 
                 MediaType.DATA, MediaType.NAVI_JSON -> {
@@ -252,14 +267,28 @@ object MessageParser {
                             val json = JSONObject(jsonString)
                             json.keys().asSequence().associateWith { json.get(it) }
                         } catch (e: JSONException) {
-                            logWarn("[MessageParser] Failed to parse media metadata JSON: ${e.message}")
+                            val rawPreview = try {
+                                val raw = ByteArray(header.length - 5)
+                                System.arraycopy(payload, 4, raw, 0, raw.size)
+                                String(raw, StandardCharsets.UTF_8).take(256)
+                            } catch (_: Exception) { "(unreadable)" }
+                            logWarn(
+                                "[MessageParser] Failed to parse media JSON: ${e.message} raw=$rawPreview",
+                                Logger.Tags.PROTO_UNKNOWN,
+                            )
                             emptyMap()
                         }
                     }
                 }
 
                 else -> {
-                    emptyMap()
+                    // Unknown subtype — preserve raw bytes for diagnostic logging
+                    val preview = if (header.length > 4) {
+                        val limit = (header.length - 4).coerceAtMost(64)
+                        payload.drop(4).take(limit).joinToString(" ") { "%02X".format(it) } +
+                            if (header.length - 4 > 64) " … (${header.length - 4}B total)" else ""
+                    } else ""
+                    mapOf("_unknownSubtype" to typeInt, "_hexPreview" to preview)
                 }
             }
 
@@ -296,7 +325,7 @@ object MessageParser {
                 null
             }
 
-        return PluggedMessage(header, phoneType, wifi)
+        return PluggedMessage(header, phoneType, wifi, rawPhoneType = phoneTypeId)
     }
 
     private fun parseBoxSettings(
@@ -304,13 +333,13 @@ object MessageParser {
         payload: ByteArray?,
     ): Message {
         if (payload == null || header.length < 2) {
-            return UnknownMessage(header)
+            return UnknownMessage(header, payload)
         }
 
         // Payload is null-terminated JSON string
         val jsonString = String(payload, 0, header.length, StandardCharsets.UTF_8).trim('\u0000')
         if (jsonString.isEmpty()) {
-            return UnknownMessage(header)
+            return UnknownMessage(header, payload)
         }
 
         return try {
@@ -320,7 +349,7 @@ object MessageParser {
             BoxSettingsMessage(header, json, isPhoneInfo)
         } catch (e: JSONException) {
             logWarn("[MessageParser] Failed to parse BoxSettings JSON: ${e.message}")
-            UnknownMessage(header)
+            UnknownMessage(header, payload)
         }
     }
 
@@ -329,7 +358,7 @@ object MessageParser {
         payload: ByteArray?,
     ): Message {
         if (payload == null || header.length < 17) {
-            return UnknownMessage(header)
+            return UnknownMessage(header, payload)
         }
 
         // Payload is 17 bytes ASCII MAC "XX:XX:XX:XX:XX:XX" (may be null-terminated)
@@ -355,6 +384,45 @@ object MessageParser {
         if (payload == null || header.length < 4) return StatusValueMessage(header, -1)
         val buffer = ByteBuffer.wrap(payload, 0, header.length).order(ByteOrder.LITTLE_ENDIAN)
         return StatusValueMessage(header, buffer.int)
+    }
+
+    /**
+     * Parse BluetoothPairedList (0x12).
+     *
+     * The adapter sends paired devices as concatenated MAC+Name strings.
+     * Entries may or may not be null-separated. The MAC pattern (XX:XX:XX:XX:XX:XX)
+     * is used as a reliable delimiter to split entries.
+     *
+     * Example payloads:
+     *   "64:31:35:8C:29:69Luis"                          — single device
+     *   "64:31:35:8C:29:69Zeno\0B0:D5:FB:A3:7E:AAPixel"  — null-separated
+     *   "64:31:35:8C:29:69ZenoB0:D5:FB:A3:7E:AAPixel 10" — no separator
+     */
+    private val BT_MAC_PATTERN = Regex("[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}")
+
+    private fun parseBluetoothPairedList(
+        header: MessageHeader,
+        payload: ByteArray?,
+    ): Message {
+        if (payload == null || header.length < 17) {
+            return BluetoothPairedListMessage(header, "", emptyList())
+        }
+        val raw = String(payload, 0, header.length, StandardCharsets.UTF_8)
+            .replace(Regex("[\\x00-\\x1F\\x7F]+"), "") // strip all control characters
+        val devices = mutableListOf<Pair<String, String>>()
+
+        // Find all MAC addresses in the string — each starts a new device entry
+        val macMatches = BT_MAC_PATTERN.findAll(raw).toList()
+        for ((idx, match) in macMatches.withIndex()) {
+            val mac = match.value
+            val nameStart = match.range.last + 1
+            // Name runs from after MAC to the start of the next MAC (or end of string)
+            val nameEnd = if (idx + 1 < macMatches.size) macMatches[idx + 1].range.first else raw.length
+            val name = raw.substring(nameStart, nameEnd).trim().ifEmpty { mac }
+            devices.add(Pair(mac, name))
+        }
+
+        return BluetoothPairedListMessage(header, raw, devices)
     }
 
     private fun parseStringPayload(
@@ -416,11 +484,22 @@ sealed class Message(
 
 /**
  * Unknown or unhandled message type.
+ * Preserves raw payload bytes for diagnostic logging.
  */
 class UnknownMessage(
     header: MessageHeader,
+    val rawPayload: ByteArray? = null,
 ) : Message(header) {
-    override fun toString(): String = "UnknownMessage(type=0x${header.rawType.toString(16)}, ${header.length}B)"
+    /** First 64 bytes as hex for log output. */
+    fun hexPreview(): String {
+        if (rawPayload == null || rawPayload.isEmpty()) return "(no payload)"
+        val limit = header.length.coerceAtMost(64)
+        val hex = rawPayload.take(limit).joinToString(" ") { "%02X".format(it) }
+        return if (header.length > 64) "$hex … (${header.length}B total)" else hex
+    }
+
+    override fun toString(): String =
+        "UnknownMessage(type=0x${header.rawType.toString(16)}, ${header.length}B, ${hexPreview()})"
 }
 
 /**
@@ -447,8 +526,15 @@ class PluggedMessage(
     header: MessageHeader,
     val phoneType: PhoneType,
     val wifi: Int?,
+    /** Raw phone type integer from wire — preserved even when phoneType maps to UNKNOWN */
+    val rawPhoneType: Int = phoneType.id,
 ) : Message(header) {
-    override fun toString(): String = "Plugged(phoneType=${phoneType.name}, wifi=$wifi)"
+    override fun toString(): String =
+        if (phoneType == PhoneType.UNKNOWN) {
+            "Plugged(phoneType=UNKNOWN rawId=$rawPhoneType / 0x${rawPhoneType.toString(16)}, wifi=$wifi)"
+        } else {
+            "Plugged(phoneType=${phoneType.name}, wifi=$wifi)"
+        }
 }
 
 /**
@@ -473,6 +559,8 @@ class AudioDataMessage(
     val volumeDuration: Float?,
     val audioDataOffset: Int = 0,
     val audioDataLength: Int = data?.size ?: 0,
+    /** Raw command byte from wire — preserved even when command maps to UNKNOWN */
+    val rawCommandId: Int = command?.id ?: -1,
 ) : Message(header) {
     override fun toString(): String {
         val format = AudioFormats.fromDecodeType(decodeType)
@@ -568,6 +656,19 @@ class StatusValueMessage(
     val value: Int,
 ) : Message(header) {
     override fun toString(): String = "StatusValue($value / 0x${value.toString(16)})"
+}
+
+/**
+ * Parsed Bluetooth paired device list (0x12).
+ * Payload format: "MAC1Name1\u0000MAC2Name2\u0000..." or "MAC1Name1" single entry.
+ * MAC is 17 chars ("XX:XX:XX:XX:XX:XX"), remainder is the device name.
+ */
+class BluetoothPairedListMessage(
+    header: MessageHeader,
+    val rawPayload: String,
+    val devices: List<Pair<String, String>>, // (btMac, name)
+) : Message(header) {
+    override fun toString(): String = "BluetoothPairedList(${devices.size} devices: ${devices.joinToString { "${it.second}(${it.first})" }})"
 }
 
 /**

@@ -5,6 +5,7 @@ import androidx.car.app.model.CarIcon
 import androidx.car.app.navigation.model.Maneuver
 import androidx.core.graphics.drawable.IconCompat
 import com.carlink.logging.Logger
+import com.carlink.logging.logInfo
 import com.carlink.logging.logNavi
 import com.carlink.logging.logWarn
 
@@ -23,8 +24,11 @@ import com.carlink.logging.logWarn
  * NaviTurnSide controls U-turn direction (LEFT vs RIGHT) and roundabout rotation (CW vs CCW).
  */
 object ManeuverMapper {
-    /** Cache built Maneuver objects by (cpType shl 4) or turnSide to avoid icon thrashing. */
+    /** Cache built Maneuver objects to avoid icon thrashing. */
     private val maneuverCache = HashMap<Int, Maneuver>()
+
+    /** Identity hash of the AA icon Bitmap used in the last cached entry. */
+    private var lastCachedAaIconHash = 0
 
     /**
      * Map a CPManeuverType + turnSide to a Maneuver.TYPE_* constant.
@@ -87,12 +91,12 @@ object ManeuverMapper {
                 }
 
                 8 -> {
-                    Maneuver.TYPE_OFF_RAMP_NORMAL_RIGHT
+                    if (isLeftDrive) Maneuver.TYPE_OFF_RAMP_NORMAL_LEFT else Maneuver.TYPE_OFF_RAMP_NORMAL_RIGHT
                 }
 
                 // rampOff (highway exit)
                 9 -> {
-                    Maneuver.TYPE_ON_RAMP_NORMAL_RIGHT
+                    if (isLeftDrive) Maneuver.TYPE_ON_RAMP_NORMAL_LEFT else Maneuver.TYPE_ON_RAMP_NORMAL_RIGHT
                 }
 
                 // rampOn (merge onto highway)
@@ -121,6 +125,10 @@ object ManeuverMapper {
                 }
 
                 // keepRight
+                15 -> Maneuver.TYPE_FERRY_BOAT // enterFerry
+                16 -> Maneuver.TYPE_FERRY_BOAT // exitFerry
+                17 -> Maneuver.TYPE_FERRY_BOAT // changeFerry
+
                 18 -> {
                     if (isLeftDrive) {
                         Maneuver.TYPE_U_TURN_RIGHT // uTurnToRoute
@@ -247,9 +255,10 @@ object ManeuverMapper {
         return exitNumber
     }
 
-    /** Evict maneuver cache on disconnect. */
+    /** Evict maneuver cache on disconnect or icon change. */
     fun clearCache() {
         maneuverCache.clear()
+        lastCachedAaIconHash = 0
     }
 
     /**
@@ -275,9 +284,26 @@ object ManeuverMapper {
         turnSide: Int,
         context: Context,
     ): Maneuver {
-        val cacheKey = (cpType shl 4) or turnSide
-        maneuverCache[cacheKey]?.let { return it }
+        val aaIcon =
+            NavigationStateManager.currentManeuverIcon
+                ?.takeIf { NavigationStateManager.canUseAaManeuverIcon() }
+        val aaIconHash = aaIcon?.let { System.identityHashCode(it) } ?: 0
+        val cacheKey = (cpType shl 16) or (turnSide shl 8) or (if (aaIcon != null) 1 else 0)
 
+        maneuverCache[cacheKey]?.let { cached ->
+            if (aaIcon == null || aaIconHash == lastCachedAaIconHash) {
+                return cached
+            }
+        }
+
+        // Always resolve the real maneuver type. The active GM cluster path
+        // (ClusterMainSession -> NavigationManager.updateTrip()) consumes the Trip
+        // as pure data — the real type feeds GM's OnStarTurnByTurnManager for
+        // classification, fallback rendering, and roundabout exit counting.
+        //
+        // Icon source depends on protocol:
+        //   AA      -> adapter-forwarded NAVI_IMAGE bitmap (Google Maps pre-rendered)
+        //   CarPlay -> static VectorDrawable resource icons (stable IPC hashing)
         val type = mapManeuverType(cpType, turnSide)
         val builder = Maneuver.Builder(type)
 
@@ -285,12 +311,19 @@ object ManeuverMapper {
             builder.setRoundaboutExitNumber(it)
         }
 
-        // Use resource icon — hashes by (packageName, resId), stable across IPC.
-        // createWithBitmap() uses Bitmap.identityHashCode which changes on every
-        // IPC deserialization, causing Templates Host to generate a new iconId
-        // every ~1s distance update → ClusterIconShimProvider cache thrashing.
-        val resId = ManeuverIconRenderer.drawableForManeuver(cpType)
-        val icon = CarIcon.Builder(IconCompat.createWithResource(context, resId)).build()
+        val icon: CarIcon
+        if (aaIcon != null) {
+            icon = CarIcon.Builder(IconCompat.createWithBitmap(aaIcon)).build()
+            lastCachedAaIconHash = aaIconHash
+            logInfo(
+                "[MANEUVER] AA bitmap (${aaIcon.width}x${aaIcon.height}), type=$type " +
+                    "(cpType=$cpType, turnSide=$turnSide)",
+                tag = Logger.Tags.NAVI,
+            )
+        } else {
+            val resId = ManeuverIconRenderer.drawableForManeuver(cpType)
+            icon = CarIcon.Builder(IconCompat.createWithResource(context, resId)).build()
+        }
         builder.setIcon(icon)
 
         return builder.build().also { maneuverCache[cacheKey] = it }
