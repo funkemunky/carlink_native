@@ -103,7 +103,7 @@ class DualStreamAudioManager(
     private val bufferMultiplier = audioConfig.bufferMultiplier
     private val prefillThresholdMs = audioConfig.prefillThresholdMs
     private val underrunRecoveryThreshold = 10
-    private val minBufferLevelMs = 50 // Reduced from 100ms - USB P99 jitter only 7ms
+    private val minBufferLevelMs = audioConfig.minBufferLevelMs
 
     @Volatile private var navStarted = false
 
@@ -176,7 +176,8 @@ class DualStreamAudioManager(
                         "sampleRate=${audioConfig.sampleRate}Hz, " +
                         "bufferMult=${audioConfig.bufferMultiplier}x, " +
                         "perfMode=$perfModeStr, " +
-                        "prefill=${audioConfig.prefillThresholdMs}ms",
+                        "prefill=${audioConfig.prefillThresholdMs}ms, " +
+                        "minBufLevel=${audioConfig.minBufferLevelMs}ms",
                 )
                 return true
             } catch (e: Exception) {

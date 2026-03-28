@@ -80,6 +80,18 @@ object PlatformDetector {
          */
         fun requiresGmAaosAudioFixes(): Boolean = isIntel && isGmAaos
 
+        /**
+         * Returns true if Intel-specific audio optimizations should be applied.
+         * Covers any Intel x86/x86_64 platform that is NOT already handled by
+         * [requiresGmAaosAudioFixes] (which takes priority).
+         *
+         * Intel platforms (including "Adam" / Apollo Lake / Broxton variants) share
+         * CPU scheduling characteristics that cause audio ring buffers to drain during
+         * concurrent H.264 video decode. Larger buffers and PERFORMANCE_MODE_NONE
+         * compensate for these scheduling gaps.
+         */
+        fun requiresIntelAudioFixes(): Boolean = isIntel && !isGmAaos
+
         override fun toString(): String =
             "PlatformInfo(arch=$cpuArch, intel=$isIntel, gm=$isGmAaos, " +
                 "hwDecoder=${hardwareH264DecoderName ?: "software"}, " +
@@ -136,7 +148,8 @@ object PlatformDetector {
         if (BuildConfig.DEBUG) {
             Log.i(TAG, "[PLATFORM] Detected: $info")
             Log.i(TAG, "[PLATFORM] Hardware H.264 decoder: ${hardwareH264DecoderName ?: "none (software fallback)"}")
-            Log.i(TAG, "[PLATFORM] Intel-specific fixes: ${info.requiresIntelMediaCodecFixes()}")
+            Log.i(TAG, "[PLATFORM] Intel-specific codec fixes: ${info.requiresIntelMediaCodecFixes()}")
+            Log.i(TAG, "[PLATFORM] Intel audio fixes: ${info.requiresIntelAudioFixes()}")
             Log.i(TAG, "[PLATFORM] GM AAOS audio fixes: ${info.requiresGmAaosAudioFixes()}")
             Log.i(TAG, "[PLATFORM] Broxton platform: $isBroxton, Display: ${displayWidth}x$displayHeight")
         }
