@@ -15,7 +15,7 @@ android {
         applicationId = "cc.funkemunky.carlink"
         minSdk = 32
         targetSdk = 36
-        versionCode = 102
+        versionCode = 103
         versionName = "1.0.0"
 
 //###############################################
